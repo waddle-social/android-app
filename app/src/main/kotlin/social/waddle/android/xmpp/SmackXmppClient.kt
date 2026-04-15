@@ -29,6 +29,7 @@ import org.jivesoftware.smack.packet.Message
 import org.jivesoftware.smack.packet.Presence
 import org.jivesoftware.smack.packet.Stanza
 import org.jivesoftware.smack.packet.StanzaBuilder
+import org.jivesoftware.smack.provider.ProviderManager
 import org.jivesoftware.smack.tcp.XMPPTCPConnection
 import org.jivesoftware.smack.tcp.XMPPTCPConnectionConfiguration
 import org.jivesoftware.smack.util.StringUtils
@@ -38,6 +39,8 @@ import org.jivesoftware.smackx.disco.ServiceDiscoveryManager
 import org.jivesoftware.smackx.httpfileupload.HttpFileUploadManager
 import org.jivesoftware.smackx.mam.element.MamElements
 import org.jivesoftware.smackx.mam.element.MamFinIQ
+import org.jivesoftware.smackx.mam.provider.MamFinIQProvider
+import org.jivesoftware.smackx.mam.provider.MamResultProvider
 import org.jivesoftware.smackx.muc.packet.MUCInitialPresence
 import org.jivesoftware.smackx.receipts.DeliveryReceiptRequest
 import org.jxmpp.jid.impl.JidCreate
@@ -85,6 +88,7 @@ class SmackXmppClient
                 mutableConnectionState.value = XmppConnectionState.Connecting
                 runCatching {
                     AndroidSmackInitializer.initialize(context)
+                    registerMamProviders()
                     registerOAuthBearer()
                     val nextNickname = nicknameFor(session)
                     buildConnection(session, environment).also { next ->
@@ -813,6 +817,13 @@ class SmackXmppClient
             }
         }
 
+        private fun registerMamProviders() {
+            listOf(MAM_NAMESPACE, MAM_V1_NAMESPACE).forEach { namespace ->
+                ProviderManager.addIQProvider(MAM_FIN_ELEMENT, namespace, MamFinIQProvider())
+                ProviderManager.addExtensionProvider(MAM_RESULT_ELEMENT, namespace, MamResultProvider())
+            }
+        }
+
         private fun ChatFileAttachment.toFileSharingExtension(): org.jivesoftware.smack.packet.XmlElement =
             XmppExtensions.fileSharing(
                 url = url,
@@ -896,6 +907,9 @@ class SmackXmppClient
         private companion object {
             const val DEFAULT_MUC_NICKNAME = "waddle"
             const val ANDROID_MUC_NICKNAME_SEGMENT = "android"
+            const val MAM_FIN_ELEMENT = "fin"
+            const val MAM_RESULT_ELEMENT = "result"
+            const val MAM_V1_NAMESPACE = "urn:xmpp:mam:1"
             const val INCOMING_BUFFER_SIZE = 64
             const val MAM_COLLECTOR_SIZE = 128
             const val MAM_PAGE_SIZE = 100

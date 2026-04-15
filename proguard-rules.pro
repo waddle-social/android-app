@@ -1,3 +1,5 @@
 -keep class org.jivesoftware.smack.** { *; }
+-keep class org.jivesoftware.smackx.** { *; }
 -keep class org.jxmpp.** { *; }
 -keep class kotlinx.serialization.** { *; }
+-keepattributes Signature,*Annotation*,InnerClasses,EnclosingMethod
