@@ -1,0 +1,43 @@
+# Gradle / Kotlin
+.gradle/
+.gradle-user-home/
+.kotlin/
+build/
+**/build/
+
+# Local Android SDK / emulator state
+.android/
+local.properties
+captures/
+
+# Native and generated Android build output
+.cxx/
+.externalNativeBuild/
+
+# IDE / editor state
+.idea/
+.vscode/
+*.iml
+
+# Logs and diagnostics
+logs/
+*.log
+.emulator.log
+logcat-prod.log
+
+# Build artifacts
+*.apk
+*.ap_
+*.aab
+*.aar
+
+# Signing material and local secrets
+*.jks
+*.keystore
+*.p12
+*.pfx
+keystore.properties
+secrets.properties
+
+# OS noise
+.DS_Store
