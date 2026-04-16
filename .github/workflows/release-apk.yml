@@ -48,7 +48,7 @@ jobs:
           RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
         run: |
           mkdir -p build/ci
-          KEYSTORE_PATH="$(pwd)/build/ci/release.keystore"
+          KEYSTORE_PATH="$(pwd)/build/ci/waddle-ci-release.keystore"
           if [ -n "$RELEASE_KEYSTORE_BASE64" ] \
              && [ -n "$RELEASE_KEYSTORE_PASSWORD" ] \
              && [ -n "$RELEASE_KEY_ALIAS" ] \
