@@ -91,6 +91,14 @@ class SmackXmppClient
         private val mutableIncomingMessages = MutableSharedFlow<XmppHistoryMessage>(extraBufferCapacity = INCOMING_BUFFER_SIZE)
         private val mutableIncomingDirectMessages = MutableSharedFlow<XmppDirectMessage>(extraBufferCapacity = INCOMING_BUFFER_SIZE)
         private val mutablePresences = MutableStateFlow<Map<String, Boolean>>(emptyMap())
+
+        // Serialises connect()/disconnect() so the three callers that
+        // bootstrap the session (ChatViewModel, WaddleMessagingService,
+        // WaddleCatchUpWorker) cannot race each other into building three
+        // concurrent Smack connections — we'd authenticate, then the server
+        // would race our duplicate sessions and close one at random,
+        // leaving `connection` pointing at a dead stream.
+        private val lifecycleMutex = Mutex()
         private val roomJoinMutex = Mutex()
         private val joinedRoomJids = Collections.synchronizedSet(mutableSetOf<String>())
         private val reconnectScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -119,72 +127,85 @@ class SmackXmppClient
             session: StoredSession,
             environment: WaddleEnvironment,
         ) {
-            withContext(Dispatchers.IO) {
-                val existing = connection
-                if (existing != null &&
-                    existing.isAuthenticated &&
-                    accountBareJid == session.jid
-                ) {
-                    WaddleLog.info("XMPP already authenticated for ${session.jid}; skipping reconnect.")
-                    return@withContext
-                }
-                intentionalDisconnect = false
-                reconnectionAttempt = 0
-                lastDisconnectCause = null
-                mutableConnectionState.value = XmppConnectionState.Connecting
-                runCatching {
-                    AndroidSmackInitializer.initialize(context)
-                    registerMamProviders()
-                    registerOAuthBearer()
-                    val nextNickname = nicknameFor(session)
-                    buildConnection(session, environment).also { next ->
-                        mucNickname = nextNickname
-                        accountUserId = session.userId
-                        accountUsername = session.username
-                        accountBareJid = session.jid
-                        joinedRoomJids.clear()
-                        configureConnection(next)
-                        next.connect()
-                        next.login()
-                        enablePostLoginFeatures(next)
-                        connection = next
-                        // Only register the ConnectivityManager callback once we
-                        // have an active connection to nudge. Registering earlier
-                        // and then throwing out of the connect() path leaks a
-                        // system-wide callback that we'd never unregister.
-                        registerNetworkCallback()
-                        mutableConnectionState.value = XmppConnectionState.Connected(session.jid)
-                    }
-                }.onFailure { throwable ->
-                    WaddleLog.error("XMPP connection failed.", throwable)
-                    unregisterNetworkCallback()
-                    mutableConnectionState.value = XmppConnectionState.Failed(throwable.message ?: throwable::class.java.simpleName)
-                    throw throwable
+            lifecycleMutex.withLock {
+                withContext(Dispatchers.IO) {
+                    doConnect(session, environment)
                 }
             }
         }
 
-        override suspend fun disconnect() {
-            withContext(Dispatchers.IO) {
-                intentionalDisconnect = true
-                reconnectJob?.cancel()
-                reconnectJob = null
-                hurryReconnect = null
-                unregisterNetworkCallback()
-                connection?.let { activeConnection ->
-                    ReconnectionManager.getInstanceFor(activeConnection).disableAutomaticReconnection()
-                    activeConnection.disconnect()
-                }
-                connection = null
-                mucNickname = null
-                accountUserId = null
-                accountUsername = null
-                accountBareJid = null
-                joinedRoomJids.clear()
-                reconnectionAttempt = 0
-                lastDisconnectCause = null
-                mutableConnectionState.value = XmppConnectionState.Disconnected
+        private fun doConnect(
+            session: StoredSession,
+            environment: WaddleEnvironment,
+        ) {
+            val existing = connection
+            if (existing != null &&
+                existing.isAuthenticated &&
+                accountBareJid == session.jid
+            ) {
+                WaddleLog.info("XMPP already authenticated for ${session.jid}; skipping reconnect.")
+                return
             }
+            intentionalDisconnect = false
+            reconnectionAttempt = 0
+            lastDisconnectCause = null
+            mutableConnectionState.value = XmppConnectionState.Connecting
+            runCatching {
+                AndroidSmackInitializer.initialize(context)
+                registerMamProviders()
+                registerOAuthBearer()
+                val nextNickname = nicknameFor(session)
+                buildConnection(session, environment).also { next ->
+                    mucNickname = nextNickname
+                    accountUserId = session.userId
+                    accountUsername = session.username
+                    accountBareJid = session.jid
+                    joinedRoomJids.clear()
+                    configureConnection(next)
+                    next.connect()
+                    next.login()
+                    enablePostLoginFeatures(next)
+                    connection = next
+                    // Only register the ConnectivityManager callback once we
+                    // have an active connection to nudge. Registering earlier
+                    // and then throwing out of the connect() path leaks a
+                    // system-wide callback that we'd never unregister.
+                    registerNetworkCallback()
+                    mutableConnectionState.value = XmppConnectionState.Connected(session.jid)
+                }
+            }.onFailure { throwable ->
+                WaddleLog.error("XMPP connection failed.", throwable)
+                unregisterNetworkCallback()
+                mutableConnectionState.value = XmppConnectionState.Failed(throwable.message ?: throwable::class.java.simpleName)
+                throw throwable
+            }
+        }
+
+        override suspend fun disconnect() {
+            lifecycleMutex.withLock {
+                withContext(Dispatchers.IO) { doDisconnect() }
+            }
+        }
+
+        private fun doDisconnect() {
+            intentionalDisconnect = true
+            reconnectJob?.cancel()
+            reconnectJob = null
+            hurryReconnect = null
+            unregisterNetworkCallback()
+            connection?.let { activeConnection ->
+                ReconnectionManager.getInstanceFor(activeConnection).disableAutomaticReconnection()
+                activeConnection.disconnect()
+            }
+            connection = null
+            mucNickname = null
+            accountUserId = null
+            accountUsername = null
+            accountBareJid = null
+            joinedRoomJids.clear()
+            reconnectionAttempt = 0
+            lastDisconnectCause = null
+            mutableConnectionState.value = XmppConnectionState.Disconnected
         }
 
         @Synchronized

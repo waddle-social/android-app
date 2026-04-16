@@ -20,9 +20,14 @@ import social.waddle.android.xmpp.XmppConnectionState
  *  - If the foreground service is alive and the XMPP stream is [XmppConnectionState.Connected],
  *    there is nothing to do — return success and let the live service keep handling messages.
  *  - If the connection is down (OEM killed the service, Doze deferred it, etc.),
- *    briefly connect, let the MAM catch-up + carbons drain into [WaddleNotificationPoster],
- *    then disconnect again. The next live user interaction or the BOOT_COMPLETED
- *    receiver will re-start the foreground service for real.
+ *    ask the [ChatRepository] to connect. The XMPP singleton serialises connects
+ *    via a mutex, so if the UI / service happen to bring up their own stream at
+ *    the same time we will deduplicate to one connection.
+ *
+ * **The worker never calls `xmppClient.disconnect()`.** A live connection may
+ * be owned by the foreground service or the UI; tearing it down from here
+ * shoots a live stream out from under them. We let the natural teardown path
+ * (logout / process death) handle it.
  */
 @HiltWorker
 class WaddleCatchUpWorker
@@ -46,21 +51,12 @@ class WaddleCatchUpWorker
                 // Live service is already handling the stream — no-op.
                 return Result.success()
             }
-            var weConnected = false
-            try {
-                notificationPoster.start(session.jid)
-                chatRepository.connect(session)
-                weConnected = true
-                // Linger long enough for MAM catch-up (warmDmArchive +
-                // XEP-0198 resumption) to drain new messages into the
-                // notification poster.
-                delay(CATCH_UP_LINGER_MILLIS)
-            } finally {
-                if (weConnected) {
-                    runCatching { xmppClient.disconnect() }
-                    notificationPoster.stop()
-                }
-            }
+            notificationPoster.start(session.jid)
+            chatRepository.connect(session)
+            // Linger long enough for MAM catch-up (warmDmArchive +
+            // XEP-0198 resumption) to drain new messages into the
+            // notification poster.
+            delay(CATCH_UP_LINGER_MILLIS)
             return Result.success()
         }
 
