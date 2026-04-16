@@ -163,6 +163,8 @@ dependencies {
 
     implementation(libs.androidx.activity.compose)
     implementation(libs.androidx.appcompat)
+    implementation(libs.androidx.biometric)
+    implementation(libs.coil.compose)
     implementation(libs.androidx.compose.material.icons.extended)
     implementation(libs.androidx.compose.material3)
     implementation(libs.androidx.compose.ui)
@@ -177,8 +179,11 @@ dependencies {
     implementation(libs.androidx.navigation3.ui)
     implementation(libs.androidx.room.ktx)
     implementation(libs.androidx.room.runtime)
+    implementation(libs.androidx.work.runtime)
+    implementation(libs.androidx.hilt.work)
     implementation(libs.appauth)
     implementation(libs.hilt.android)
+    implementation(libs.jsoup)
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.kotlinx.serialization.json)
     implementation(libs.ktor.client.android)
@@ -194,6 +199,7 @@ dependencies {
     implementation(libs.smack.websocket.okhttp)
 
     ksp(libs.androidx.room.compiler)
+    ksp(libs.androidx.hilt.compiler)
     ksp(libs.hilt.compiler)
 
     debugImplementation(libs.androidx.compose.ui.tooling)

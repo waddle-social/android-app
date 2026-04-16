@@ -11,8 +11,12 @@ object WaddleLog {
 
     fun error(
         message: String,
-        throwable: Throwable,
+        throwable: Throwable? = null,
     ) {
-        Log.e(TAG, message, throwable)
+        if (throwable != null) {
+            Log.e(TAG, message, throwable)
+        } else {
+            Log.e(TAG, message)
+        }
     }
 }

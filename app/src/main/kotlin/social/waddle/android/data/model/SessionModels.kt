@@ -15,6 +15,8 @@ data class AuthProviderSummary(
 data class StoredSession(
     val environmentId: String,
     val accessToken: String,
+    val refreshToken: String? = null,
+    val accessTokenExpiresAt: String? = null,
     val sessionId: String,
     val userId: String,
     val username: String,

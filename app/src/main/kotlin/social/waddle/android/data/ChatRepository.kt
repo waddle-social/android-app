@@ -4,6 +4,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -45,7 +46,9 @@ import social.waddle.android.data.model.WaddleSummary
 import social.waddle.android.data.network.WaddleApi
 import social.waddle.android.util.WaddleLog
 import social.waddle.android.xmpp.ChatState
+import social.waddle.android.xmpp.SessionProvider
 import social.waddle.android.xmpp.XmppClient
+import social.waddle.android.xmpp.XmppConnectionState
 import social.waddle.android.xmpp.XmppDirectMessage
 import social.waddle.android.xmpp.XmppHistoryMessage
 import java.time.Instant
@@ -69,12 +72,16 @@ class ChatRepository
         private val pendingOutboundDao: PendingOutboundDao,
         private val xmppClient: XmppClient,
         private val api: WaddleApi,
+        private val sessionProvider: SessionProvider,
     ) {
         private val repositoryScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         private var incomingMessagesJob: Job? = null
         private var incomingDirectMessagesJob: Job? = null
+        private var connectionStateJob: Job? = null
         private val mutableRoomTyping = MutableStateFlow<Map<String, Set<String>>>(emptyMap())
         private val mutableDirectTyping = MutableStateFlow<Map<String, Boolean>>(emptyMap())
+        private val roomTypingTimeouts = mutableMapOf<RoomTypingKey, Job>()
+        private val directTypingTimeouts = mutableMapOf<String, Job>()
 
         fun observeWaddles(): Flow<List<WaddleEntity>> = waddleDao.observeWaddles()
 
@@ -92,15 +99,55 @@ class ChatRepository
 
         fun observeDirectTyping(): StateFlow<Map<String, Boolean>> = mutableDirectTyping.asStateFlow()
 
+        fun observePresences(): StateFlow<Map<String, Boolean>> = xmppClient.presences
+
         fun observeDmConversations(): Flow<List<DmConversationEntity>> = dmConversationDao.observeConversations()
 
         fun observeDmMessages(peerJid: String): Flow<List<DmMessageEntity>> = dmMessageDao.observeMessages(peerJid)
 
         suspend fun connect(session: StoredSession) {
-            xmppClient.connect(session, session.environment)
+            // Start collectors BEFORE login so live messages delivered immediately
+            // after authentication are not dropped into a SharedFlow without subscribers.
             startIncomingMessageCollection()
             startIncomingDirectMessageCollection()
-            replayPending()
+            startConnectionStateWatch()
+            xmppClient.connect(session, session.environment)
+            // replayPending is also triggered by the connection-state watch on every
+            // successful (re)connect, so we don't need to call it here.
+            warmDmArchive(session)
+        }
+
+        private suspend fun warmDmArchive(session: StoredSession) {
+            runCatching {
+                val page = xmppClient.loadAllDirectMessageHistory(ownBareJid = session.jid)
+                if (page.messages.isEmpty()) {
+                    return@runCatching
+                }
+                cacheDirectMessageHistoryPage(page.messages)
+                WaddleLog.info("Warmed ${page.messages.size} DM archive messages on connect.")
+            }.onFailure { throwable ->
+                WaddleLog.error("Failed to warm DM archive on connect.", throwable)
+            }
+        }
+
+        private fun startConnectionStateWatch() {
+            if (connectionStateJob?.isActive == true) {
+                return
+            }
+            connectionStateJob =
+                repositoryScope.launch {
+                    var wasConnected = false
+                    xmppClient.connectionState.collect { state ->
+                        val nowConnected = state is XmppConnectionState.Connected
+                        if (nowConnected && !wasConnected) {
+                            runCatching { replayPending() }
+                                .onFailure { throwable ->
+                                    WaddleLog.error("Failed to replay pending outbound after connect.", throwable)
+                                }
+                        }
+                        wasConnected = nowConnected
+                    }
+                }
         }
 
         suspend fun refreshWaddles(session: StoredSession) =
@@ -425,8 +472,8 @@ class ChatRepository
                 )
             dmMessageDao.upsert(message)
             upsertConversation(message)
-            val stanzaId = xmppClient.sendDirectMessage(peerJid, body, localId)
-            dmMessageDao.markSent(localId, stanzaId)
+            xmppClient.sendDirectMessage(peerJid, body, localId)
+            dmMessageDao.clearPending(localId)
         }
 
         suspend fun sendDirectAttachment(
@@ -466,8 +513,8 @@ class ChatRepository
                 )
             dmMessageDao.upsert(message)
             upsertConversation(message)
-            val stanzaId = xmppClient.sendDirectMessage(peerJid, body, localId, sharedFile)
-            dmMessageDao.markSent(localId, stanzaId)
+            xmppClient.sendDirectMessage(peerJid, body, localId, sharedFile)
+            dmMessageDao.clearPending(localId)
         }
 
         suspend fun sendDirectDisplayed(
@@ -528,6 +575,7 @@ class ChatRepository
             waddleId: String,
             channelId: String,
             body: String,
+            replyToMessageId: String? = null,
         ) = withContext(Dispatchers.IO) {
             val channel = requireNotNull(channelDao.getChannel(channelId)) { "Channel $channelId is not cached." }
             val localId = UUID.randomUUID().toString()
@@ -538,6 +586,7 @@ class ChatRepository
                     roomJid = channel.roomJid,
                     body = body,
                     stanzaId = localId,
+                    replyToMessageId = replyToMessageId,
                 )
             messageDao.upsert(
                 MessageEntity(
@@ -551,7 +600,7 @@ class ChatRepository
                     body = body,
                     createdAt = now,
                     editedAt = null,
-                    replyToMessageId = null,
+                    replyToMessageId = replyToMessageId,
                     mentions = extractBodyMentions(body).joinToStringOrNull(),
                     broadcastMention = extractBroadcastMention(body),
                     sharedFileUrl = null,
@@ -580,8 +629,8 @@ class ChatRepository
                     retryCount = 0,
                 ),
             )
-            val stanzaId = xmppClient.sendGroupMessage(draft)
-            messageDao.markSent(localId, stanzaId)
+            xmppClient.sendGroupMessage(draft)
+            messageDao.clearPending(localId)
             pendingOutboundDao.delete(localId)
         }
 
@@ -634,8 +683,8 @@ class ChatRepository
                     pending = true,
                 ),
             )
-            val stanzaId = xmppClient.sendGroupMessage(draft)
-            messageDao.markSent(localId, stanzaId)
+            xmppClient.sendGroupMessage(draft)
+            messageDao.clearPending(localId)
         }
 
         suspend fun sendDisplayed(
@@ -703,16 +752,15 @@ class ChatRepository
 
         private suspend fun replayPending() {
             pendingOutboundDao.pending().forEach { pending ->
-                val stanzaId =
-                    xmppClient.sendGroupMessage(
-                        ChatMessageDraft(
-                            channelId = pending.channelId,
-                            roomJid = pending.roomJid,
-                            body = pending.body,
-                            stanzaId = pending.id,
-                        ),
-                    )
-                messageDao.markSent(pending.id, stanzaId)
+                xmppClient.sendGroupMessage(
+                    ChatMessageDraft(
+                        channelId = pending.channelId,
+                        roomJid = pending.roomJid,
+                        body = pending.body,
+                        stanzaId = pending.id,
+                    ),
+                )
+                messageDao.clearPending(pending.id)
                 pendingOutboundDao.delete(pending.id)
             }
         }
@@ -753,28 +801,94 @@ class ChatRepository
             channel: ChannelEntity,
             history: List<XmppHistoryMessage>,
         ) {
-            val messages =
-                history
-                    .filter { message -> message.isTimelineMessage() }
-                    .map { it.toEntity(channel) }
-            messageDao.upsertAll(messages)
+            history
+                .filter { message -> message.isTimelineMessage() }
+                .forEach { message -> upsertRoomHistoryMessage(channel, message) }
             history
                 .filterNot { message -> message.isTimelineMessage() }
                 .filter { message -> message.chatState == null }
                 .forEach { message -> applyMessageUpdate(message) }
         }
 
+        private suspend fun upsertRoomHistoryMessage(
+            channel: ChannelEntity,
+            message: XmppHistoryMessage,
+        ) {
+            val existingByServerId =
+                message.serverId?.let { serverId -> messageDao.getIdByServerId(serverId) }
+            if (existingByServerId == null) {
+                message.originStanzaId
+                    ?.takeIf { it != message.id }
+                    ?.takeIf { messageDao.existsById(it) }
+                    ?.let { pendingLocalId -> messageDao.deleteById(pendingLocalId) }
+            }
+            messageDao.upsert(message.toEntity(channel, id = existingByServerId ?: message.id))
+        }
+
         private suspend fun cacheDirectMessageHistoryPage(history: List<XmppDirectMessage>) {
-            dmMessageDao.upsertAll(
-                history
-                    .filter { message -> message.isDirectTimelineMessage() }
-                    .map { message -> message.toEntity() },
-            )
+            history
+                .filter { message -> message.isDirectTimelineMessage() }
+                .forEach { message -> upsertDirectHistoryMessage(message) }
             history
                 .filterNot { message -> message.isDirectTimelineMessage() }
                 .filter { message -> message.chatState == null }
                 .forEach { message -> applyDirectMessageUpdate(message) }
-            history.lastOrNull { message -> message.isDirectTimelineMessage() }?.let { upsertConversation(it) }
+            // Update the conversation preview for the most recent message of every peer
+            // in this page. Historical/archived messages must not bump unread counts.
+            history
+                .asSequence()
+                .filter { message -> message.isDirectTimelineMessage() }
+                .groupBy(XmppDirectMessage::peerJid)
+                .forEach { (_, group) ->
+                    group.maxByOrNull { it.createdAt }?.let { latest ->
+                        upsertConversationPreview(
+                            peerJid = latest.peerJid,
+                            body = latest.body,
+                            createdAt = latest.createdAt,
+                        )
+                    }
+                }
+        }
+
+        private suspend fun upsertConversationPreview(
+            peerJid: String,
+            body: String,
+            createdAt: String,
+        ) {
+            val existing = dmConversationDao.getConversation(peerJid)
+            val updated =
+                DmConversationEntity(
+                    peerJid = peerJid,
+                    peerUsername = existing?.peerUsername ?: peerJid.substringBefore('@'),
+                    peerAvatarUrl = existing?.peerAvatarUrl,
+                    lastMessageBody = body.takeIf { it.isNotBlank() } ?: existing?.lastMessageBody,
+                    lastMessageAt =
+                        maxOfNullable(existing?.lastMessageAt, createdAt) ?: createdAt,
+                    unreadCount = existing?.unreadCount ?: 0,
+                )
+            dmConversationDao.upsert(updated)
+        }
+
+        private fun maxOfNullable(
+            left: String?,
+            right: String?,
+        ): String? =
+            when {
+                left == null -> right
+                right == null -> left
+                else -> if (left >= right) left else right
+            }
+
+        private suspend fun upsertDirectHistoryMessage(message: XmppDirectMessage) {
+            val existingByServerId =
+                message.serverId?.let { serverId -> dmMessageDao.getIdByServerId(serverId) }
+            if (existingByServerId == null) {
+                message.originStanzaId
+                    ?.takeIf { it != message.id }
+                    ?.takeIf { dmMessageDao.existsById(it) }
+                    ?.let { pendingLocalId -> dmMessageDao.deleteById(pendingLocalId) }
+            }
+            dmMessageDao.upsert(message.toEntity(id = existingByServerId ?: message.id))
         }
 
         private suspend fun cacheIncomingMessage(message: XmppHistoryMessage) {
@@ -787,8 +901,20 @@ class ChatRepository
                 applyMessageUpdate(message)
                 return
             }
-            val existingId = message.serverId?.let { serverId -> messageDao.getIdByServerId(serverId) }
-            messageDao.upsert(message.toEntity(channel, id = existingId ?: message.id))
+            val existingByServerId =
+                message.serverId?.let { serverId -> messageDao.getIdByServerId(serverId) }
+            if (existingByServerId == null) {
+                message.originStanzaId
+                    ?.takeIf { it != message.id }
+                    ?.takeIf { messageDao.existsById(it) }
+                    ?.let { pendingLocalId ->
+                        messageDao.deleteById(pendingLocalId)
+                        WaddleLog.info(
+                            "Reconciled pending outbound $pendingLocalId with server id ${message.id}.",
+                        )
+                    }
+            }
+            messageDao.upsert(message.toEntity(channel, id = existingByServerId ?: message.id))
             WaddleLog.info("Cached live XMPP message ${message.id} for channel ${channel.id}.")
         }
 
@@ -797,8 +923,20 @@ class ChatRepository
                 applyDirectMessageUpdate(message)
                 return
             }
-            val existingId = message.serverId?.let { serverId -> dmMessageDao.getIdByServerId(serverId) }
-            val entity = message.toEntity(id = existingId ?: message.id)
+            val existingByServerId =
+                message.serverId?.let { serverId -> dmMessageDao.getIdByServerId(serverId) }
+            if (existingByServerId == null) {
+                message.originStanzaId
+                    ?.takeIf { it != message.id }
+                    ?.takeIf { dmMessageDao.existsById(it) }
+                    ?.let { pendingLocalId ->
+                        dmMessageDao.deleteById(pendingLocalId)
+                        WaddleLog.info(
+                            "Reconciled pending outbound DM $pendingLocalId with server id ${message.id}.",
+                        )
+                    }
+            }
+            val entity = message.toEntity(id = existingByServerId ?: message.id)
             dmMessageDao.upsert(entity)
             upsertConversation(entity)
             WaddleLog.info("Cached live direct XMPP message ${message.id}.")
@@ -897,29 +1035,74 @@ class ChatRepository
         }
 
         private suspend fun upsertConversation(message: XmppDirectMessage) {
-            dmConversationDao.upsert(
-                DmConversationEntity(
-                    peerJid = message.peerJid,
-                    peerUsername = message.peerJid.substringBefore('@'),
-                    peerAvatarUrl = null,
-                    lastMessageBody = message.body.takeIf { it.isNotBlank() },
-                    lastMessageAt = message.createdAt,
-                    unreadCount = 0,
-                ),
+            upsertConversationRow(
+                peerJid = message.peerJid,
+                body = message.body,
+                createdAt = message.createdAt,
+                incoming = message.fromJid == message.peerJid,
             )
         }
 
         private suspend fun upsertConversation(message: DmMessageEntity) {
+            upsertConversationRow(
+                peerJid = message.peerJid,
+                body = message.body,
+                createdAt = message.createdAt,
+                incoming = message.fromJid == message.peerJid,
+            )
+        }
+
+        private suspend fun upsertConversationRow(
+            peerJid: String,
+            body: String,
+            createdAt: String,
+            incoming: Boolean,
+        ) {
+            val existing = dmConversationDao.getConversation(peerJid)
+            val baseUnread = existing?.unreadCount ?: 0
+            val nextUnread = if (incoming) baseUnread + 1 else baseUnread
             dmConversationDao.upsert(
                 DmConversationEntity(
-                    peerJid = message.peerJid,
-                    peerUsername = message.peerJid.substringBefore('@'),
-                    peerAvatarUrl = null,
-                    lastMessageBody = message.body.takeIf { it.isNotBlank() },
-                    lastMessageAt = message.createdAt,
-                    unreadCount = 0,
+                    peerJid = peerJid,
+                    peerUsername = existing?.peerUsername ?: peerJid.substringBefore('@'),
+                    peerAvatarUrl = existing?.peerAvatarUrl,
+                    lastMessageBody = body.takeIf { it.isNotBlank() } ?: existing?.lastMessageBody,
+                    lastMessageAt = createdAt,
+                    unreadCount = nextUnread,
                 ),
             )
+        }
+
+        suspend fun markDmRead(peerJid: String) =
+            withContext(Dispatchers.IO) {
+                dmConversationDao.markRead(peerJid)
+            }
+
+        /** Look up a cached channel by its MUC room JID (used for deep-link routing). */
+        suspend fun channelByRoomJid(roomJid: String): ChannelEntity? =
+            withContext(Dispatchers.IO) { channelDao.getChannelByRoomJid(roomJid) }
+
+        /**
+         * Called from the notification-action receiver when the user types a reply
+         * in the DM notification. We don't have an [AuthSession] in a broadcast
+         * context so we resolve one via the session provider (which refreshes the
+         * OAuth token if needed).
+         */
+        suspend fun sendDirectMessageFromNotification(
+            peerJid: String,
+            body: String,
+        ) = withContext(Dispatchers.IO) {
+            val session = sessionProvider.currentSession() ?: error("No active session for reply.")
+            sendDirectMessage(session, peerJid, body)
+        }
+
+        suspend fun sendRoomMessageFromNotification(
+            roomJid: String,
+            body: String,
+        ) = withContext(Dispatchers.IO) {
+            val session = sessionProvider.currentSession() ?: error("No active session for reply.")
+            val channel = channelDao.getChannelByRoomJid(roomJid) ?: error("Unknown room: $roomJid")
+            sendMessage(session, channel.waddleId, channel.id, body)
         }
 
         private fun XmppHistoryMessage.toEntity(
@@ -1027,6 +1210,10 @@ class ChatRepository
             sender: String,
             chatState: ChatState,
         ) {
+            val key = RoomTypingKey(roomJid, sender)
+            synchronized(roomTypingTimeouts) {
+                roomTypingTimeouts.remove(key)?.cancel()
+            }
             mutableRoomTyping.update { current ->
                 val next = current.toMutableMap()
                 val typers = next[roomJid].orEmpty().toMutableSet()
@@ -1042,12 +1229,44 @@ class ChatRepository
                 }
                 next
             }
+            if (chatState == ChatState.Composing) {
+                val timeoutJob =
+                    repositoryScope.launch {
+                        delay(TYPING_TIMEOUT_MILLIS)
+                        clearRoomTyper(key)
+                    }
+                synchronized(roomTypingTimeouts) {
+                    roomTypingTimeouts[key] = timeoutJob
+                }
+            }
+        }
+
+        private fun clearRoomTyper(key: RoomTypingKey) {
+            synchronized(roomTypingTimeouts) {
+                roomTypingTimeouts.remove(key)
+            }
+            mutableRoomTyping.update { current ->
+                val typers = current[key.roomJid]?.toMutableSet() ?: return@update current
+                if (!typers.remove(key.sender)) {
+                    return@update current
+                }
+                val next = current.toMutableMap()
+                if (typers.isEmpty()) {
+                    next.remove(key.roomJid)
+                } else {
+                    next[key.roomJid] = typers
+                }
+                next
+            }
         }
 
         private fun updateDirectTyping(
             peerJid: String,
             chatState: ChatState,
         ) {
+            synchronized(directTypingTimeouts) {
+                directTypingTimeouts.remove(peerJid)?.cancel()
+            }
             mutableDirectTyping.update { current ->
                 val next = current.toMutableMap()
                 if (chatState == ChatState.Composing) {
@@ -1057,7 +1276,34 @@ class ChatRepository
                 }
                 next
             }
+            if (chatState == ChatState.Composing) {
+                val timeoutJob =
+                    repositoryScope.launch {
+                        delay(TYPING_TIMEOUT_MILLIS)
+                        clearDirectTyping(peerJid)
+                    }
+                synchronized(directTypingTimeouts) {
+                    directTypingTimeouts[peerJid] = timeoutJob
+                }
+            }
         }
+
+        private fun clearDirectTyping(peerJid: String) {
+            synchronized(directTypingTimeouts) {
+                directTypingTimeouts.remove(peerJid)
+            }
+            mutableDirectTyping.update { current ->
+                if (current[peerJid] != true) {
+                    return@update current
+                }
+                current.toMutableMap().apply { remove(peerJid) }
+            }
+        }
+
+        private data class RoomTypingKey(
+            val roomJid: String,
+            val sender: String,
+        )
 
         private fun pageHasMore(
             pageComplete: Boolean,
@@ -1090,6 +1336,7 @@ class ChatRepository
 
         private companion object {
             const val MAX_MAM_PAGES = 20
+            const val TYPING_TIMEOUT_MILLIS = 10_000L
             val MENTION_PATTERN = Regex("(?:^|\\s)@(\\S+)")
             val EVERYONE_PATTERN = Regex("(?:^|\\s)@everyone(?:\\s|$)", RegexOption.IGNORE_CASE)
             val HERE_PATTERN = Regex("(?:^|\\s)@here(?:\\s|$)", RegexOption.IGNORE_CASE)

@@ -81,14 +81,17 @@ interface MessageDao {
     @Query("SELECT id FROM messages WHERE serverId = :serverId LIMIT 1")
     suspend fun getIdByServerId(serverId: String): String?
 
+    @Query("SELECT EXISTS(SELECT 1 FROM messages WHERE id = :id)")
+    suspend fun existsById(id: String): Boolean
+
+    @Query("DELETE FROM messages WHERE id = :id")
+    suspend fun deleteById(id: String)
+
     @Query("DELETE FROM messages")
     suspend fun clear()
 
-    @Query("UPDATE messages SET pending = 0, serverId = :serverId WHERE id = :localId")
-    suspend fun markSent(
-        localId: String,
-        serverId: String?,
-    )
+    @Query("UPDATE messages SET pending = 0 WHERE id = :localId")
+    suspend fun clearPending(localId: String)
 
     @Query("UPDATE messages SET body = :body, editedAt = :editedAt WHERE id = :messageId OR serverId = :messageId")
     suspend fun markEdited(
@@ -106,8 +109,14 @@ interface DmConversationDao {
     @Query("SELECT * FROM dm_conversations ORDER BY lastMessageAt DESC")
     fun observeConversations(): Flow<List<DmConversationEntity>>
 
+    @Query("SELECT * FROM dm_conversations WHERE peerJid = :peerJid LIMIT 1")
+    suspend fun getConversation(peerJid: String): DmConversationEntity?
+
     @Upsert
     suspend fun upsert(conversation: DmConversationEntity)
+
+    @Query("UPDATE dm_conversations SET unreadCount = 0 WHERE peerJid = :peerJid")
+    suspend fun markRead(peerJid: String)
 
     @Query("DELETE FROM dm_conversations")
     suspend fun clear()
@@ -130,11 +139,14 @@ interface DmMessageDao {
     @Query("SELECT id FROM dm_messages WHERE serverId = :serverId LIMIT 1")
     suspend fun getIdByServerId(serverId: String): String?
 
-    @Query("UPDATE dm_messages SET pending = 0, serverId = :serverId WHERE id = :localId")
-    suspend fun markSent(
-        localId: String,
-        serverId: String?,
-    )
+    @Query("SELECT EXISTS(SELECT 1 FROM dm_messages WHERE id = :id)")
+    suspend fun existsById(id: String): Boolean
+
+    @Query("DELETE FROM dm_messages WHERE id = :id")
+    suspend fun deleteById(id: String)
+
+    @Query("UPDATE dm_messages SET pending = 0 WHERE id = :localId")
+    suspend fun clearPending(localId: String)
 
     @Query("UPDATE dm_messages SET body = :body, editedAt = :editedAt WHERE id = :messageId OR serverId = :messageId")
     suspend fun markEdited(
@@ -277,6 +289,18 @@ interface DeliveryStateDao {
 
     @Query("DELETE FROM delivery_states")
     suspend fun clear()
+}
+
+@Dao
+interface LinkPreviewDao {
+    @Query("SELECT * FROM link_previews WHERE url = :url LIMIT 1")
+    suspend fun get(url: String): LinkPreviewEntity?
+
+    @Upsert
+    suspend fun upsert(preview: LinkPreviewEntity)
+
+    @Query("DELETE FROM link_previews WHERE fetchedAtEpochMillis < :before")
+    suspend fun evictOlderThan(before: Long)
 }
 
 @Dao

@@ -12,6 +12,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.stateIn
@@ -19,6 +21,10 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import social.waddle.android.data.ChatRepository
+import social.waddle.android.data.DraftRepository
+import social.waddle.android.data.LinkPreview
+import social.waddle.android.data.LinkPreviewRepository
+import social.waddle.android.data.MuteRepository
 import social.waddle.android.data.db.ChannelEntity
 import social.waddle.android.data.db.DeliverySummary
 import social.waddle.android.data.db.DmConversationEntity
@@ -31,6 +37,8 @@ import social.waddle.android.data.model.MemberSummary
 import social.waddle.android.data.model.OutboundFileAttachment
 import social.waddle.android.data.model.UserSearchResult
 import social.waddle.android.data.model.WaddleSummary
+import social.waddle.android.notifications.ActiveConversation
+import social.waddle.android.notifications.ActiveConversationTracker
 import social.waddle.android.util.WaddleLog
 import javax.inject.Inject
 
@@ -66,9 +74,38 @@ class ChatViewModel
     constructor(
         @param:ApplicationContext private val context: Context,
         private val repository: ChatRepository,
+        private val activeConversationTracker: ActiveConversationTracker,
+        private val draftRepository: DraftRepository,
+        private val muteRepository: MuteRepository,
+        private val linkPreviewRepository: LinkPreviewRepository,
     ) : ViewModel() {
         private val mutableState = MutableStateFlow(ChatUiState())
         val state: StateFlow<ChatUiState> = mutableState.asStateFlow()
+
+        init {
+            viewModelScope.launch {
+                combine(mutableState, channels) { uiState, channelList ->
+                    when {
+                        uiState.mode == ChatMode.DirectMessages && uiState.selectedDmPeerJid != null -> {
+                            ActiveConversation.Direct(uiState.selectedDmPeerJid)
+                        }
+
+                        uiState.mode == ChatMode.Rooms && uiState.selectedChannelId != null -> {
+                            val roomJid =
+                                channelList
+                                    .firstOrNull { it.id == uiState.selectedChannelId }
+                                    ?.roomJid
+                            roomJid?.let(ActiveConversation::Room)
+                        }
+
+                        else -> {
+                            null
+                        }
+                    }
+                }.distinctUntilChanged()
+                    .collect { active -> activeConversationTracker.setActive(active) }
+            }
+        }
 
         val waddles: StateFlow<List<WaddleEntity>> =
             repository
@@ -124,6 +161,80 @@ class ChatViewModel
             repository
                 .observeDirectTyping()
                 .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyMap())
+
+        val channelDraft: StateFlow<String> =
+            mutableState
+                .flatMapLatest { uiState ->
+                    uiState.selectedChannelId?.let(draftRepository::observeChannelDraft) ?: flowOf("")
+                }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), "")
+
+        val directDraft: StateFlow<String> =
+            mutableState
+                .flatMapLatest { uiState ->
+                    uiState.selectedDmPeerJid?.let(draftRepository::observeDirectDraft) ?: flowOf("")
+                }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), "")
+
+        fun setChannelDraft(text: String) {
+            val channelId = mutableState.value.selectedChannelId ?: return
+            viewModelScope.launch { draftRepository.setChannelDraft(channelId, text) }
+        }
+
+        fun setDirectDraft(text: String) {
+            val peerJid = mutableState.value.selectedDmPeerJid ?: return
+            viewModelScope.launch { draftRepository.setDirectDraft(peerJid, text) }
+        }
+
+        val mutedConversations: StateFlow<Set<String>> =
+            muteRepository.muted
+                .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptySet())
+
+        val presences: StateFlow<Map<String, Boolean>> =
+            repository
+                .observePresences()
+                .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyMap())
+
+        val linkPreviews: StateFlow<Map<String, LinkPreview>> = linkPreviewRepository.previews
+
+        fun requestLinkPreview(url: String) {
+            linkPreviewRepository.requestPreview(url)
+        }
+
+        fun toggleRoomMute(roomJid: String) {
+            val key = MuteRepository.roomKey(roomJid)
+            viewModelScope.launch {
+                val current = muteRepository.snapshot()
+                muteRepository.setMuted(key, key !in current)
+            }
+        }
+
+        fun toggleDirectMute(peerJid: String) {
+            val key = MuteRepository.directKey(peerJid)
+            viewModelScope.launch {
+                val current = muteRepository.snapshot()
+                muteRepository.setMuted(key, key !in current)
+            }
+        }
+
+        private val mutableRoomReply = MutableStateFlow<String?>(null)
+        val replyToMessageId: StateFlow<String?> = mutableRoomReply.asStateFlow()
+        private val mutableDirectReply = MutableStateFlow<String?>(null)
+        val replyToDirectMessageId: StateFlow<String?> = mutableDirectReply.asStateFlow()
+
+        fun startRoomReply(message: MessageEntity) {
+            mutableRoomReply.value = message.serverId ?: message.id
+        }
+
+        fun clearRoomReply() {
+            mutableRoomReply.value = null
+        }
+
+        fun startDirectReply(message: DmMessageEntity) {
+            mutableDirectReply.value = message.serverId ?: message.id
+        }
+
+        fun clearDirectReply() {
+            mutableDirectReply.value = null
+        }
 
         private var connectedSessionId: String? = null
         private var currentSession: AuthSession? = null
@@ -211,8 +322,15 @@ class ChatViewModel
             }
             viewModelScope.launch {
                 runCatching {
-                    if (currentSession == null) return@runCatching
+                    val session = currentSession ?: return@runCatching
                     repository.refreshMessages(channelId)
+                    // Preload members so @mention autocomplete has data to match against.
+                    // Fire-and-forget; failure is non-fatal.
+                    runCatching {
+                        repository.members(session.stored, waddleId)
+                    }.onSuccess { members ->
+                        mutableState.update { it.copy(members = members) }
+                    }
                 }.onFailure(::showError)
             }
         }
@@ -286,6 +404,7 @@ class ChatViewModel
             }
             viewModelScope.launch {
                 runCatching {
+                    repository.markDmRead(peerJid)
                     repository.refreshDirectMessages(session.stored, peerJid)
                 }.onFailure(::showError)
             }
@@ -315,6 +434,7 @@ class ChatViewModel
                 mutableState.update { it.copy(sending = true, error = null) }
                 runCatching {
                     repository.sendDirectMessage(session.stored, peerJid, body.trim())
+                    draftRepository.setDirectDraft(peerJid, "")
                 }.onFailure(::showError)
                 mutableState.update { it.copy(sending = false) }
             }
@@ -610,10 +730,19 @@ class ChatViewModel
         ) {
             val selectedWaddleId = mutableState.value.selectedWaddleId ?: return
             val selectedChannelId = mutableState.value.selectedChannelId ?: return
+            val replyTo = mutableRoomReply.value
             viewModelScope.launch {
                 mutableState.update { it.copy(sending = true, error = null) }
                 runCatching {
-                    repository.sendMessage(session.stored, selectedWaddleId, selectedChannelId, body.trim())
+                    repository.sendMessage(
+                        session = session.stored,
+                        waddleId = selectedWaddleId,
+                        channelId = selectedChannelId,
+                        body = body.trim(),
+                        replyToMessageId = replyTo,
+                    )
+                    draftRepository.setChannelDraft(selectedChannelId, "")
+                    mutableRoomReply.value = null
                 }.onFailure(::showError)
                 mutableState.update { it.copy(sending = false) }
             }
@@ -686,6 +815,52 @@ class ChatViewModel
 
         fun clearError() {
             mutableState.update { it.copy(error = null) }
+        }
+
+        /**
+         * Open a DM for the given peer from a deep link (e.g. notification tap).
+         * We try to resolve a session on demand so the caller doesn't have to.
+         */
+        fun openDirectMessageFromIntent(peerJid: String) {
+            val session = currentSession ?: return
+            selectDirectMessage(session, peerJid)
+        }
+
+        /**
+         * Open the channel that owns the given room JID from a deep link.
+         * Requires the channel to be cached in Room; if it's not yet, we
+         * kick a refresh and wait for the flow to pick it up.
+         */
+        fun openRoomFromIntent(roomJid: String) {
+            val session = currentSession ?: return
+            viewModelScope.launch {
+                runCatching {
+                    val channel = repository.channelByRoomJid(roomJid)
+                    if (channel != null) {
+                        mutableState.update {
+                            it.copy(
+                                mode = ChatMode.Rooms,
+                                selectedWaddleId = channel.waddleId,
+                                selectedChannelId = channel.id,
+                                error = null,
+                            )
+                        }
+                        repository.refreshMessages(channel.id)
+                    }
+                }.onFailure(::showError)
+            }
+        }
+
+        fun reset() {
+            connectedSessionId = null
+            currentSession = null
+            mutableState.value = ChatUiState()
+            activeConversationTracker.setActive(null)
+        }
+
+        override fun onCleared() {
+            activeConversationTracker.setActive(null)
+            super.onCleared()
         }
 
         private fun showError(throwable: Throwable) {

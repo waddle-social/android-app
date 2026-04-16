@@ -1,7 +1,15 @@
 package social.waddle.android.xmpp
 
+import android.annotation.SuppressLint
 import android.content.Context
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
+import android.provider.Settings
+import androidx.core.content.getSystemService
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -14,11 +22,13 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import org.jivesoftware.smack.AbstractXMPPConnection
 import org.jivesoftware.smack.ConnectionConfiguration
 import org.jivesoftware.smack.ConnectionListener
@@ -42,6 +52,7 @@ import org.jivesoftware.smack.tcp.XMPPTCPConnectionConfiguration
 import org.jivesoftware.smack.util.StringUtils
 import org.jivesoftware.smack.websocket.XmppWebSocketTransportModuleDescriptor
 import org.jivesoftware.smack.websocket.okhttp.OkHttpWebSocketFactory
+import org.jivesoftware.smackx.carbons.CarbonManager
 import org.jivesoftware.smackx.disco.ServiceDiscoveryManager
 import org.jivesoftware.smackx.httpfileupload.HttpFileUploadManager
 import org.jivesoftware.smackx.mam.element.MamElements
@@ -62,6 +73,7 @@ import social.waddle.android.util.WaddleLog
 import java.net.URI
 import java.util.Collections
 import javax.inject.Inject
+import javax.inject.Provider
 import javax.inject.Singleton
 
 @Singleton
@@ -70,10 +82,15 @@ class SmackXmppClient
     @Inject
     constructor(
         @param:ApplicationContext private val context: Context,
+        // Provider<> breaks the AuthRepository ↔ SmackXmppClient construction cycle.
+        // We only need the session when actually reconnecting, so lazy resolution
+        // is safe and natural.
+        private val sessionProvider: Provider<SessionProvider>,
     ) : XmppClient {
         private val mutableConnectionState = MutableStateFlow<XmppConnectionState>(XmppConnectionState.Disconnected)
         private val mutableIncomingMessages = MutableSharedFlow<XmppHistoryMessage>(extraBufferCapacity = INCOMING_BUFFER_SIZE)
         private val mutableIncomingDirectMessages = MutableSharedFlow<XmppDirectMessage>(extraBufferCapacity = INCOMING_BUFFER_SIZE)
+        private val mutablePresences = MutableStateFlow<Map<String, Boolean>>(emptyMap())
         private val roomJoinMutex = Mutex()
         private val joinedRoomJids = Collections.synchronizedSet(mutableSetOf<String>())
         private val reconnectScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -84,21 +101,33 @@ class SmackXmppClient
         private var accountBareJid: String? = null
         private var reconnectionAttempt = 0
         private var lastDisconnectCause: String? = null
+        private var networkCallback: ConnectivityManager.NetworkCallback? = null
 
         @Volatile private var intentionalDisconnect = false
 
         @Volatile private var reconnectJob: Job? = null
 
+        @Volatile private var hurryReconnect: (() -> Unit)? = null
+
         override val connectionState: StateFlow<XmppConnectionState> = mutableConnectionState.asStateFlow()
         override val incomingMessages: Flow<XmppHistoryMessage> = mutableIncomingMessages.asSharedFlow()
         override val incomingDirectMessages: Flow<XmppDirectMessage> = mutableIncomingDirectMessages.asSharedFlow()
         override val supportedFeatures: List<XepFeature> = XmppFeatureRegistry.supported
+        override val presences: StateFlow<Map<String, Boolean>> = mutablePresences.asStateFlow()
 
         override suspend fun connect(
             session: StoredSession,
             environment: WaddleEnvironment,
         ) {
             withContext(Dispatchers.IO) {
+                val existing = connection
+                if (existing != null &&
+                    existing.isAuthenticated &&
+                    accountBareJid == session.jid
+                ) {
+                    WaddleLog.info("XMPP already authenticated for ${session.jid}; skipping reconnect.")
+                    return@withContext
+                }
                 intentionalDisconnect = false
                 reconnectionAttempt = 0
                 lastDisconnectCause = null
@@ -117,11 +146,18 @@ class SmackXmppClient
                         configureConnection(next)
                         next.connect()
                         next.login()
+                        enablePostLoginFeatures(next)
                         connection = next
+                        // Only register the ConnectivityManager callback once we
+                        // have an active connection to nudge. Registering earlier
+                        // and then throwing out of the connect() path leaks a
+                        // system-wide callback that we'd never unregister.
+                        registerNetworkCallback()
                         mutableConnectionState.value = XmppConnectionState.Connected(session.jid)
                     }
                 }.onFailure { throwable ->
                     WaddleLog.error("XMPP connection failed.", throwable)
+                    unregisterNetworkCallback()
                     mutableConnectionState.value = XmppConnectionState.Failed(throwable.message ?: throwable::class.java.simpleName)
                     throw throwable
                 }
@@ -133,6 +169,8 @@ class SmackXmppClient
                 intentionalDisconnect = true
                 reconnectJob?.cancel()
                 reconnectJob = null
+                hurryReconnect = null
+                unregisterNetworkCallback()
                 connection?.let { activeConnection ->
                     ReconnectionManager.getInstanceFor(activeConnection).disableAutomaticReconnection()
                     activeConnection.disconnect()
@@ -147,6 +185,38 @@ class SmackXmppClient
                 lastDisconnectCause = null
                 mutableConnectionState.value = XmppConnectionState.Disconnected
             }
+        }
+
+        @Synchronized
+        private fun registerNetworkCallback() {
+            if (networkCallback != null) return
+            val manager = context.getSystemService<ConnectivityManager>() ?: return
+            val request =
+                NetworkRequest
+                    .Builder()
+                    .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                    .addCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+                    .build()
+            val callback =
+                object : ConnectivityManager.NetworkCallback() {
+                    override fun onAvailable(network: Network) {
+                        if (intentionalDisconnect) return
+                        // If a reconnect loop is sleeping, skip its backoff and try now.
+                        hurryReconnect?.invoke()
+                    }
+                }
+            runCatching { manager.registerNetworkCallback(request, callback) }
+                .onSuccess { networkCallback = callback }
+                .onFailure { throwable -> WaddleLog.error("Could not register network callback.", throwable) }
+        }
+
+        @Synchronized
+        private fun unregisterNetworkCallback() {
+            val callback = networkCallback ?: return
+            val manager = context.getSystemService<ConnectivityManager>() ?: return
+            runCatching { manager.unregisterNetworkCallback(callback) }
+                .onFailure { throwable -> WaddleLog.error("Could not unregister network callback.", throwable) }
+            networkCallback = null
         }
 
         override suspend fun discoverWaddles(session: StoredSession): List<XmppWaddleRef> =
@@ -339,6 +409,78 @@ class SmackXmppClient
                 fullText = null,
                 maxResults = MAM_PAGE_SIZE,
             )
+
+        override suspend fun loadAllDirectMessageHistory(
+            ownBareJid: String,
+            beforeId: String?,
+            maxResults: Int,
+        ): XmppMessagePage<XmppDirectMessage> =
+            withConnection { activeConnection ->
+                val queryId = StringUtils.secureUniqueRandomString()
+                val iqId = StringUtils.secureUniqueRandomString()
+                // MamDirectHistoryQueryIq with blank peerJid emits no `with` filter,
+                // which yields the user's entire 1:1 archive.
+                val query =
+                    MamDirectHistoryQueryIq(
+                        queryId = queryId,
+                        maxResults = maxResults,
+                        peerJid = "",
+                        afterId = null,
+                        beforeId = beforeId,
+                        fullText = null,
+                    ).apply {
+                        stanzaId = iqId
+                        type = IQ.Type.set
+                        to = JidCreate.entityBareFrom(ownBareJid)
+                    }
+                val history = mutableListOf<XmppDirectMessage>()
+                var fin: MamFinIQ? = null
+                val collector =
+                    activeConnection.createStanzaCollector(
+                        StanzaCollector
+                            .newConfiguration()
+                            .setStanzaFilter(MamHistoryFilter(queryId = queryId, iqId = iqId))
+                            .setSize(MAM_COLLECTOR_SIZE),
+                    )
+                try {
+                    activeConnection.sendStanza(query)
+                    var finished = false
+                    while (!finished) {
+                        val stanza: Stanza =
+                            collector.nextResult(MAM_QUERY_TIMEOUT_MILLIS)
+                                ?: error("Timed out waiting for DM archive MAM response.")
+                        when (stanza) {
+                            is Message -> {
+                                MamElements.MamResultExtension.from(stanza)?.let { result ->
+                                    messageMapper().directMessageFromOwnArchive(result, ownBareJid)?.let(history::add)
+                                }
+                            }
+
+                            is MamFinIQ -> {
+                                fin = stanza
+                                finished = true
+                            }
+
+                            is IQ -> {
+                                if (stanza.type == IQ.Type.error) {
+                                    error("DM archive MAM query failed: ${stanza.error}")
+                                }
+                                finished = true
+                            }
+                        }
+                    }
+                } finally {
+                    collector.cancel()
+                }
+                val messages = history.distinctBy { it.id }.sortedBy { it.createdAt }
+                WaddleLog.info("Warmed ${messages.size} DM archive messages across all peers.")
+                XmppMessagePage(
+                    messages = messages,
+                    firstId = fin?.getRSMSet()?.first ?: messages.firstOrNull()?.serverId ?: messages.firstOrNull()?.id,
+                    lastId = fin?.getRSMSet()?.last ?: messages.lastOrNull()?.serverId ?: messages.lastOrNull()?.id,
+                    complete = fin?.isComplete ?: (messages.size < maxResults),
+                )
+            }
 
         override suspend fun searchDirectMessageHistory(
             ownBareJid: String,
@@ -636,6 +778,7 @@ class SmackXmppClient
         private fun configureConnection(activeConnection: AbstractXMPPConnection) {
             registerIncomingMessageListener(activeConnection)
             registerIncomingDirectMessageListener(activeConnection)
+            registerPresenceListener(activeConnection)
             ReconnectionManager.getInstanceFor(activeConnection).disableAutomaticReconnection()
             activeConnection.addConnectionListener(
                 object : ConnectionListener {
@@ -652,25 +795,33 @@ class SmackXmppClient
                     override fun connectionClosedOnError(exception: Exception) {
                         WaddleLog.error("XMPP connection closed on error.", exception)
                         lastDisconnectCause = exception.message ?: exception::class.java.simpleName
-                        if (!intentionalDisconnect) {
-                            scheduleReconnect(activeConnection)
-                        }
+                        maybeScheduleReconnect(activeConnection)
                     }
 
                     override fun connectionClosed() {
-                        if (!intentionalDisconnect) {
-                            WaddleLog.info("XMPP connection closed unexpectedly.")
-                            scheduleReconnect(activeConnection)
+                        if (intentionalDisconnect) {
+                            mutableConnectionState.value = XmppConnectionState.Disconnected
                             return
                         }
-                        mutableConnectionState.value = XmppConnectionState.Disconnected
+                        WaddleLog.info("XMPP connection closed unexpectedly.")
+                        maybeScheduleReconnect(activeConnection)
                     }
                 },
             )
         }
 
+        private fun maybeScheduleReconnect(activeConnection: AbstractXMPPConnection) {
+            if (intentionalDisconnect) {
+                return
+            }
+            if (reconnectJob?.isActive == true) {
+                // A reconnect loop is already running; it will handle the retry schedule.
+                return
+            }
+            scheduleReconnect(activeConnection)
+        }
+
         private fun scheduleReconnect(activeConnection: AbstractXMPPConnection) {
-            reconnectJob?.cancel()
             reconnectJob =
                 reconnectScope.launch {
                     while (isActive && !intentionalDisconnect) {
@@ -695,18 +846,32 @@ class SmackXmppClient
                                 nextDelaySeconds = delaySeconds,
                                 cause = lastDisconnectCause,
                             )
-                        delay(delaySeconds * MILLIS_PER_SECOND)
+                        cancellableBackoffDelay(delaySeconds * MILLIS_PER_SECOND)
                         if (intentionalDisconnect) {
                             return@launch
                         }
                         mutableConnectionState.value = XmppConnectionState.Connecting
                         val success =
                             runCatching {
-                                if (activeConnection.isConnected) {
-                                    activeConnection.disconnect()
+                                // Before calling login() again, let the session provider refresh the
+                                // OAuth access token if it has expired during the outage. If the
+                                // bearer token changed, we must rebuild the connection — Smack's
+                                // SASL layer uses the credentials captured at ConnectionConfiguration
+                                // build time, so we can't just re-login on the existing instance.
+                                val fresh = runCatching { sessionProvider.get().currentSession() }.getOrNull()
+                                val rebuilt = maybeRebuildConnection(activeConnection, fresh)
+                                // When we land here the connection has already been closed
+                                // by the ConnectionListener that scheduled us, so we do not
+                                // call disconnect() again (which would re-enter the listener
+                                // and recursively schedule another reconnect) unless we just
+                                // built a fresh instance above.
+                                val target = rebuilt ?: activeConnection
+                                target.connect()
+                                target.login()
+                                enablePostLoginFeatures(target)
+                                if (rebuilt != null) {
+                                    connection = rebuilt
                                 }
-                                activeConnection.connect()
-                                activeConnection.login()
                             }.onFailure { throwable ->
                                 WaddleLog.error(
                                     "XMPP reconnect attempt $reconnectionAttempt failed.",
@@ -721,6 +886,51 @@ class SmackXmppClient
                 }
         }
 
+        /**
+         * If the session provider handed us a session whose bearer token differs
+         * from the one baked into the current connection, build a new Smack
+         * connection with the fresh credentials so SASL authentication has a
+         * chance of succeeding. Returns the new connection, or null if no rebuild
+         * was needed.
+         */
+        private fun maybeRebuildConnection(
+            current: AbstractXMPPConnection,
+            fresh: StoredSession?,
+        ): AbstractXMPPConnection? {
+            if (fresh == null) return null
+            val currentPassword = runCatching { current.configuration?.password }.getOrNull()
+            if (currentPassword == fresh.xmppBearerToken) return null
+            WaddleLog.info("XMPP bearer token changed during outage — rebuilding connection.")
+            registerOAuthBearer()
+            val next = buildConnection(fresh, fresh.environment)
+            configureConnection(next)
+            accountBareJid = fresh.jid
+            accountUserId = fresh.userId
+            accountUsername = fresh.username
+            mucNickname = nicknameFor(fresh)
+            joinedRoomJids.clear()
+            // Swap active pointer so disconnect() / onDestroy routes find the fresh instance.
+            // We intentionally do not call current.disconnect() here — the ConnectionListener
+            // fired connectionClosed* before scheduling us, so `current` is already dead.
+            return next
+        }
+
+        /**
+         * Waits for [millis] unless [hurryReconnect] is invoked — typically from a
+         * ConnectivityManager onAvailable callback — in which case we wake up
+         * immediately. This turns a passive backoff into an opportunistic retry
+         * that reacts the instant the OS hands us a usable network.
+         */
+        private suspend fun cancellableBackoffDelay(millis: Long) {
+            val waiter = CompletableDeferred<Unit>()
+            hurryReconnect = { if (!waiter.isCompleted) waiter.complete(Unit) }
+            try {
+                withTimeoutOrNull(millis) { waiter.await() }
+            } finally {
+                hurryReconnect = null
+            }
+        }
+
         private fun nextBackoffDelaySeconds(attempt: Int): Int {
             val exponent = (attempt - 1).coerceIn(0, MAX_BACKOFF_EXPONENT)
             val base = RECONNECT_BASE_DELAY_SECONDS.toLong() shl exponent
@@ -731,6 +941,34 @@ class SmackXmppClient
                 .coerceAtLeast(RECONNECT_BASE_DELAY_SECONDS.toLong())
                 .coerceAtMost(MAX_RECONNECT_DELAY_SECONDS.toLong())
                 .toInt()
+        }
+
+        private fun registerPresenceListener(activeConnection: AbstractXMPPConnection) {
+            activeConnection.addAsyncStanzaListener(
+                StanzaListener { stanza ->
+                    val presence = stanza as? Presence ?: return@StanzaListener
+                    val bareJid =
+                        presence.from
+                            ?.toString()
+                            ?.substringBefore('/')
+                            ?.takeIf { it.isNotBlank() }
+                            ?: return@StanzaListener
+                    val available =
+                        when (presence.type) {
+                            Presence.Type.available -> true
+
+                            Presence.Type.unavailable -> false
+
+                            // subscribe / subscribed / unsubscribe / unsubscribed / probe / error
+                            // are roster-management signals, not online-status updates.
+                            else -> return@StanzaListener
+                        }
+                    mutablePresences.update { current ->
+                        if (current[bareJid] == available) current else current + (bareJid to available)
+                    }
+                },
+                StanzaFilter { stanza -> stanza is Presence },
+            )
         }
 
         private fun registerIncomingMessageListener(activeConnection: AbstractXMPPConnection) {
@@ -891,7 +1129,29 @@ class SmackXmppClient
                             enableDefaultDebugger()
                         }
                     }.build()
-            return XMPPTCPConnection(configuration)
+            return XMPPTCPConnection(configuration).apply {
+                // XEP-0198 Stream Management — Smack gives the server a chance to resume
+                // the stream within ~5 min after a network wobble instead of rebuilding
+                // from scratch, and acks every stanza so nothing is silently dropped.
+                setUseStreamManagement(true)
+                setUseStreamManagementResumption(true)
+            }
+        }
+
+        /**
+         * Turn on XEPs that must be negotiated AFTER login (XEP-0280 Carbons and
+         * — when the transport supports it — XEP-0198 resumption). Failures here
+         * are logged but non-fatal: the connection is still usable without them.
+         */
+        private fun enablePostLoginFeatures(activeConnection: AbstractXMPPConnection) {
+            runCatching {
+                val carbons = CarbonManager.getInstanceFor(activeConnection)
+                if (carbons.isSupportedByServer && !carbons.carbonsEnabled) {
+                    carbons.enableCarbonsAsync(null)
+                }
+            }.onFailure { throwable ->
+                WaddleLog.error("Failed to enable XEP-0280 Message Carbons.", throwable)
+            }
         }
 
         private fun securityMode(environment: WaddleEnvironment): ConnectionConfiguration.SecurityMode =
@@ -927,11 +1187,7 @@ class SmackXmppClient
         private fun nicknameFor(session: StoredSession): Resourcepart {
             val preferredNickname = session.username.ifBlank { session.xmppLocalpart }
             val fallbackNickname = session.xmppLocalpart.ifBlank { DEFAULT_MUC_NICKNAME }
-            val suffix =
-                session.sessionId
-                    .filter(Char::isLetterOrDigit)
-                    .take(NICKNAME_SUFFIX_LENGTH)
-                    .lowercase()
+            val suffix = deviceNicknameSuffix()
             val deviceNickname =
                 listOf(preferredNickname, fallbackNickname)
                     .firstOrNull { it.isNotBlank() }
@@ -948,6 +1204,17 @@ class SmackXmppClient
                 ?: Resourcepart.fromOrNull(fallbackNickname)
                 ?: Resourcepart.fromOrThrowUnchecked(DEFAULT_MUC_NICKNAME)
         }
+
+        @SuppressLint("HardwareIds")
+        private fun deviceNicknameSuffix(): String =
+            runCatching {
+                Settings.Secure
+                    .getString(context.contentResolver, Settings.Secure.ANDROID_ID)
+                    .orEmpty()
+                    .filter(Char::isLetterOrDigit)
+                    .take(NICKNAME_SUFFIX_LENGTH)
+                    .lowercase()
+            }.getOrDefault("")
 
         private data class MentionReference(
             val uri: String,

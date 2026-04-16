@@ -25,6 +25,7 @@ internal class XmppMessageMapper(
             roomJid = roomJid,
             createdAt = createdAt,
             serverId = liveMessageId(message),
+            originStanzaId = message.stanzaId.nonBlank(),
             senderName = senderName,
         )
     }
@@ -46,6 +47,7 @@ internal class XmppMessageMapper(
             roomJid = roomJid,
             createdAt = createdAt,
             serverId = stableMessageId(result, message),
+            originStanzaId = message.stanzaId.nonBlank(),
             senderName = message.historySenderName(),
         )
     }
@@ -69,7 +71,8 @@ internal class XmppMessageMapper(
             ownBareJid = ownBareJid,
             peerJid = peerJid,
             createdAt = Instant.now().toString(),
-            serverId = message.stanzaId.nonBlank(),
+            serverId = liveMessageId(message),
+            originStanzaId = message.stanzaId.nonBlank(),
         )
     }
 
@@ -92,6 +95,42 @@ internal class XmppMessageMapper(
             peerJid = peerJid,
             createdAt = createdAt,
             serverId = stableMessageId(result, message),
+            originStanzaId = message.stanzaId.nonBlank(),
+        )
+    }
+
+    /**
+     * Map a MAM result from the user's own archive (no peer filter) into an
+     * [XmppDirectMessage]. The peer JID is derived from the message's from/to
+     * so callers can bucket messages into per-peer conversations.
+     */
+    fun directMessageFromOwnArchive(
+        result: MamElements.MamResultExtension,
+        ownBareJid: String,
+    ): XmppDirectMessage? {
+        val forwarded = result.forwarded ?: return null
+        val message = forwarded.forwardedStanza ?: return null
+        val fromBare = message.from?.toString()?.bareJid() ?: return null
+        val toBare = message.to?.toString()?.bareJid() ?: return null
+        val peerJid =
+            when (ownBareJid) {
+                fromBare -> toBare
+                toBare -> fromBare
+                else -> return null
+            }
+        val createdAt =
+            forwarded.delayInformation
+                ?.stamp
+                ?.toInstant()
+                ?.toString()
+                ?: Instant.now().toString()
+        return directMessageFrom(
+            message = message,
+            ownBareJid = ownBareJid,
+            peerJid = peerJid,
+            createdAt = createdAt,
+            serverId = stableMessageId(result, message),
+            originStanzaId = message.stanzaId.nonBlank(),
         )
     }
 
@@ -101,12 +140,14 @@ internal class XmppMessageMapper(
         roomJid: String,
         createdAt: String,
         serverId: String?,
+        originStanzaId: String?,
         senderName: String?,
     ): XmppHistoryMessage? {
         message.displayedTargetId()?.let { displayedId ->
             return XmppHistoryMessage(
                 id = serverId ?: fallbackMessageId(roomJid, createdAt, "displayed:$displayedId"),
                 serverId = serverId,
+                originStanzaId = originStanzaId,
                 roomJid = roomJid,
                 senderId = senderIdFor(message, senderName),
                 senderName = displayNameFor(senderName),
@@ -120,6 +161,7 @@ internal class XmppMessageMapper(
             return XmppHistoryMessage(
                 id = serverId ?: fallbackMessageId(roomJid, createdAt, "chat-state:$chatState"),
                 serverId = serverId,
+                originStanzaId = originStanzaId,
                 roomJid = roomJid,
                 senderId = senderIdFor(message, senderName),
                 senderName = displayNameFor(senderName),
@@ -133,6 +175,7 @@ internal class XmppMessageMapper(
             return XmppHistoryMessage(
                 id = serverId ?: fallbackMessageId(roomJid, createdAt, "reaction:${reaction.targetId}"),
                 serverId = serverId,
+                originStanzaId = originStanzaId,
                 roomJid = roomJid,
                 senderId = senderIdFor(message, senderName),
                 senderName = displayNameFor(senderName),
@@ -147,6 +190,7 @@ internal class XmppMessageMapper(
             return XmppHistoryMessage(
                 id = serverId ?: fallbackMessageId(roomJid, createdAt, "retract:$retractsId"),
                 serverId = serverId,
+                originStanzaId = originStanzaId,
                 roomJid = roomJid,
                 senderId = senderIdFor(message, senderName),
                 senderName = displayNameFor(senderName),
@@ -169,6 +213,7 @@ internal class XmppMessageMapper(
         return XmppHistoryMessage(
             id = serverId ?: fallbackMessageId(roomJid, createdAt, body),
             serverId = serverId,
+            originStanzaId = originStanzaId,
             roomJid = roomJid,
             senderId = senderIdFor(message, senderName),
             senderName = displayNameFor(senderName),
@@ -191,12 +236,14 @@ internal class XmppMessageMapper(
         peerJid: String,
         createdAt: String,
         serverId: String?,
+        originStanzaId: String?,
     ): XmppDirectMessage? {
         val fromBare = message.from?.toString()?.bareJid() ?: return null
         message.displayedTargetId()?.let { displayedId ->
             return XmppDirectMessage(
                 id = serverId ?: fallbackMessageId(peerJid, createdAt, "dm-displayed:$displayedId"),
                 serverId = serverId,
+                originStanzaId = originStanzaId,
                 peerJid = peerJid,
                 fromJid = fromBare,
                 senderName = directSenderName(fromBare, ownBareJid, peerJid),
@@ -210,6 +257,7 @@ internal class XmppMessageMapper(
             return XmppDirectMessage(
                 id = serverId ?: fallbackMessageId(peerJid, createdAt, "dm-chat-state:$chatState"),
                 serverId = serverId,
+                originStanzaId = originStanzaId,
                 peerJid = peerJid,
                 fromJid = fromBare,
                 senderName = directSenderName(fromBare, ownBareJid, peerJid),
@@ -223,6 +271,7 @@ internal class XmppMessageMapper(
             return XmppDirectMessage(
                 id = serverId ?: fallbackMessageId(peerJid, createdAt, "dm-reaction:${reaction.targetId}"),
                 serverId = serverId,
+                originStanzaId = originStanzaId,
                 peerJid = peerJid,
                 fromJid = fromBare,
                 senderName = directSenderName(fromBare, ownBareJid, peerJid),
@@ -237,6 +286,7 @@ internal class XmppMessageMapper(
             return XmppDirectMessage(
                 id = serverId ?: fallbackMessageId(peerJid, createdAt, "dm-retract:$retractsId"),
                 serverId = serverId,
+                originStanzaId = originStanzaId,
                 peerJid = peerJid,
                 fromJid = fromBare,
                 senderName = directSenderName(fromBare, ownBareJid, peerJid),
@@ -259,6 +309,7 @@ internal class XmppMessageMapper(
         return XmppDirectMessage(
             id = serverId ?: fallbackMessageId(peerJid, createdAt, body),
             serverId = serverId,
+            originStanzaId = originStanzaId,
             peerJid = peerJid,
             fromJid = fromBare,
             senderName = directSenderName(fromBare, ownBareJid, peerJid),
@@ -402,18 +453,13 @@ internal class XmppMessageMapper(
             ?: message.stanzaId.nonBlank()
 
     private fun liveMessageId(message: Message): String? {
-        val messageId = message.stanzaId.nonBlank()
         val stableId =
             message
                 .getExtensions(StanzaIdElement::class.java)
                 .firstOrNull()
                 ?.id
                 .nonBlank()
-        return if (message.historySenderName() == mucNickname) {
-            messageId ?: stableId
-        } else {
-            stableId ?: messageId
-        }
+        return stableId ?: message.stanzaId.nonBlank()
     }
 
     private fun Message.historySenderName(): String? {

@@ -183,3 +183,15 @@ data class PendingOutboundMessageEntity(
     val createdAt: String,
     val retryCount: Int,
 )
+
+@Entity(tableName = "link_previews")
+data class LinkPreviewEntity(
+    @PrimaryKey val url: String,
+    val title: String?,
+    val description: String?,
+    val imageUrl: String?,
+    val siteName: String?,
+    val fetchedAtEpochMillis: Long,
+    /** True when the fetch failed or the URL has no usable OG/meta data. */
+    val empty: Boolean,
+)

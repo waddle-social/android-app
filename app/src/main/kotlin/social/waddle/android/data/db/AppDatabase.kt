@@ -16,8 +16,9 @@ import androidx.room.RoomDatabase
         DmReactionEntity::class,
         DeliveryStateEntity::class,
         PendingOutboundMessageEntity::class,
+        LinkPreviewEntity::class,
     ],
-    version = 3,
+    version = 4,
     exportSchema = true,
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -42,4 +43,6 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun deliveryStateDao(): DeliveryStateDao
 
     abstract fun pendingOutboundDao(): PendingOutboundDao
+
+    abstract fun linkPreviewDao(): LinkPreviewDao
 }

@@ -15,12 +15,14 @@ import dagger.hilt.android.qualifiers.ApplicationContext
 import dagger.hilt.components.SingletonComponent
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.android.Android
+import io.ktor.client.plugins.HttpTimeout
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.client.plugins.logging.LogLevel
 import io.ktor.client.plugins.logging.Logging
 import io.ktor.serialization.kotlinx.json.json
 import kotlinx.serialization.json.Json
 import net.openid.appauth.AuthorizationService
+import social.waddle.android.auth.AuthRepository
 import social.waddle.android.data.db.AccountDao
 import social.waddle.android.data.db.AppDatabase
 import social.waddle.android.data.db.ChannelDao
@@ -28,11 +30,13 @@ import social.waddle.android.data.db.DeliveryStateDao
 import social.waddle.android.data.db.DmConversationDao
 import social.waddle.android.data.db.DmMessageDao
 import social.waddle.android.data.db.DmReactionDao
+import social.waddle.android.data.db.LinkPreviewDao
 import social.waddle.android.data.db.MessageDao
 import social.waddle.android.data.db.OccupantDao
 import social.waddle.android.data.db.PendingOutboundDao
 import social.waddle.android.data.db.ReactionDao
 import social.waddle.android.data.db.WaddleDao
+import social.waddle.android.xmpp.SessionProvider
 import social.waddle.android.xmpp.SmackXmppClient
 import social.waddle.android.xmpp.XmppClient
 import javax.inject.Singleton
@@ -63,7 +67,7 @@ object AppModule {
     ): AppDatabase =
         Room
             .databaseBuilder(context, AppDatabase::class.java, "waddle.db")
-            .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
+            .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
             .build()
 
     @Provides
@@ -100,6 +104,9 @@ object AppModule {
     fun providePendingOutboundDao(database: AppDatabase): PendingOutboundDao = database.pendingOutboundDao()
 
     @Provides
+    fun provideLinkPreviewDao(database: AppDatabase): LinkPreviewDao = database.linkPreviewDao()
+
+    @Provides
     @Singleton
     fun provideHttpClient(json: Json): HttpClient =
         HttpClient(Android) {
@@ -108,6 +115,13 @@ object AppModule {
             }
             install(Logging) {
                 level = LogLevel.INFO
+            }
+            install(HttpTimeout) {
+                // Per-request overrides drive link-preview fetches; these are
+                // conservative global defaults for everything else.
+                requestTimeoutMillis = 30_000
+                connectTimeoutMillis = 10_000
+                socketTimeoutMillis = 30_000
             }
         }
 
@@ -177,6 +191,25 @@ object AppModule {
             }
         }
 
+    private val MIGRATION_3_4 =
+        object : Migration(3, 4) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS link_previews (
+                        url TEXT NOT NULL PRIMARY KEY,
+                        title TEXT,
+                        description TEXT,
+                        imageUrl TEXT,
+                        siteName TEXT,
+                        fetchedAtEpochMillis INTEGER NOT NULL,
+                        empty INTEGER NOT NULL
+                    )
+                    """.trimIndent(),
+                )
+            }
+        }
+
     private val MESSAGE_METADATA_COLUMNS =
         listOf(
             "mentions TEXT",
@@ -203,4 +236,8 @@ abstract class XmppModule {
     @Binds
     @Singleton
     abstract fun bindXmppClient(client: SmackXmppClient): XmppClient
+
+    @Binds
+    @Singleton
+    abstract fun bindSessionProvider(authRepository: AuthRepository): SessionProvider
 }

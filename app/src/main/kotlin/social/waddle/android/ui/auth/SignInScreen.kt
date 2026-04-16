@@ -15,6 +15,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.Login
+import androidx.compose.material.icons.rounded.Warning
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -80,7 +81,33 @@ fun SignInScreen(
                     selectedProviderName = selectedProvider?.displayName,
                     onSignIn = onSignIn,
                 )
+                state.error?.let { message ->
+                    Spacer(Modifier.height(16.dp))
+                    SignInErrorBanner(message = message)
+                }
             }
+        }
+    }
+}
+
+@Composable
+private fun SignInErrorBanner(message: String) {
+    Surface(
+        color = MaterialTheme.colorScheme.errorContainer,
+        contentColor = MaterialTheme.colorScheme.onErrorContainer,
+        shape = RoundedCornerShape(12.dp),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Icon(imageVector = Icons.Rounded.Warning, contentDescription = null)
+            Text(
+                text = message,
+                style = MaterialTheme.typography.bodyMedium,
+            )
         }
     }
 }

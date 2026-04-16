@@ -67,6 +67,7 @@ data class XmppCallInvite(
 data class XmppHistoryMessage(
     val id: String,
     val serverId: String?,
+    val originStanzaId: String?,
     val roomJid: String,
     val senderId: String?,
     val senderName: String?,
@@ -90,6 +91,7 @@ data class XmppHistoryMessage(
 data class XmppDirectMessage(
     val id: String,
     val serverId: String?,
+    val originStanzaId: String?,
     val peerJid: String,
     val fromJid: String,
     val senderName: String,
@@ -114,6 +116,9 @@ interface XmppClient {
     val incomingMessages: Flow<XmppHistoryMessage>
     val incomingDirectMessages: Flow<XmppDirectMessage>
     val supportedFeatures: List<XepFeature>
+
+    /** Map of bare JID → true when we've observed an `available` presence for that peer. */
+    val presences: StateFlow<Map<String, Boolean>>
 
     suspend fun connect(
         session: StoredSession,
@@ -142,6 +147,17 @@ interface XmppClient {
         peerJid: String,
         afterId: String? = null,
         beforeId: String? = null,
+    ): XmppMessagePage<XmppDirectMessage>
+
+    /**
+     * Loads the user's whole direct-message archive (no peer filter).
+     * Used to warm DM conversation previews at connect time. The returned messages
+     * span all peers; callers should derive the peer from [XmppDirectMessage.peerJid].
+     */
+    suspend fun loadAllDirectMessageHistory(
+        ownBareJid: String,
+        beforeId: String? = null,
+        maxResults: Int = DEFAULT_ARCHIVE_MAX_RESULTS,
     ): XmppMessagePage<XmppDirectMessage>
 
     suspend fun searchMessageHistory(
@@ -236,3 +252,5 @@ data class UploadSlot(
     val getUrl: String,
     val headers: Map<String, String> = emptyMap(),
 )
+
+const val DEFAULT_ARCHIVE_MAX_RESULTS = 200

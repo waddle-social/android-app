@@ -20,6 +20,7 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -28,6 +29,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Reply
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.automirrored.rounded.Send
 import androidx.compose.material.icons.rounded.Add
@@ -38,7 +40,9 @@ import androidx.compose.material.icons.rounded.Delete
 import androidx.compose.material.icons.rounded.Done
 import androidx.compose.material.icons.rounded.Edit
 import androidx.compose.material.icons.rounded.Home
+import androidx.compose.material.icons.rounded.KeyboardArrowDown
 import androidx.compose.material.icons.rounded.MoreVert
+import androidx.compose.material.icons.rounded.NotificationsOff
 import androidx.compose.material.icons.rounded.Person
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Search
@@ -48,6 +52,7 @@ import androidx.compose.material3.AssistChip
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -63,10 +68,15 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.VerticalDivider
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
+import androidx.compose.material3.pulltorefresh.rememberPullToRefreshState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -85,6 +95,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import kotlinx.coroutines.launch
 import social.waddle.android.data.db.ChannelEntity
 import social.waddle.android.data.db.DeliverySummary
 import social.waddle.android.data.db.DmConversationEntity
@@ -524,6 +535,21 @@ private fun RoomChatLayout(
     onActiveDialogChange: (ChatDialog?) -> Unit,
     onAttachmentPicked: (Uri, String?, String?) -> Unit,
 ) {
+    val channelDraft by viewModel.channelDraft.collectAsStateWithLifecycle()
+    val replyToMessageId by viewModel.replyToMessageId.collectAsStateWithLifecycle()
+    val mutedConversations by viewModel.mutedConversations.collectAsStateWithLifecycle()
+    val mutedRoomJids =
+        mutedConversations
+            .filter { it.startsWith("room:") }
+            .map { it.removePrefix("room:") }
+            .toSet()
+    val presences by viewModel.presences.collectAsStateWithLifecycle()
+    val linkPreviews by viewModel.linkPreviews.collectAsStateWithLifecycle()
+    val replyPreview =
+        replyToMessageId?.let { targetId ->
+            val parent = lists.messages.firstOrNull { it.id == targetId || it.serverId == targetId }
+            parent?.let { ReplyPreview(it.senderName ?: "Unknown", it.body.take(200)) }
+        }
     val layoutArgs =
         ChatLayoutArgs(
             session = session,
@@ -563,6 +589,18 @@ private fun RoomChatLayout(
             onReact = { messageId, emoji -> viewModel.react(session, messageId, emoji) },
             onRetract = viewModel::retract,
             onAttachmentPicked = onAttachmentPicked,
+            draftText = channelDraft,
+            onDraftChange = viewModel::setChannelDraft,
+            replyPreview = replyPreview,
+            onStartReply = { message -> viewModel.startRoomReply(message) },
+            onClearReply = viewModel::clearRoomReply,
+            mutedRoomJids = mutedRoomJids,
+            mutedConversationKeys = mutedConversations,
+            onToggleRoomMute = viewModel::toggleRoomMute,
+            presences = presences,
+            mentionSuggestions = state.members.map { it.username },
+            linkPreviews = linkPreviews,
+            onRequestLinkPreview = viewModel::requestLinkPreview,
         )
     if (compact) {
         CompactChatLayout(args = layoutArgs)
@@ -634,6 +672,18 @@ private data class ChatLayoutArgs(
     val onReact: (String, String) -> Unit,
     val onRetract: (String) -> Unit,
     val onAttachmentPicked: (Uri, String?, String?) -> Unit,
+    val draftText: String,
+    val onDraftChange: (String) -> Unit,
+    val replyPreview: ReplyPreview?,
+    val onStartReply: (MessageEntity) -> Unit,
+    val onClearReply: () -> Unit,
+    val mutedRoomJids: Set<String>,
+    val mutedConversationKeys: Set<String>,
+    val onToggleRoomMute: (String) -> Unit,
+    val presences: Map<String, Boolean>,
+    val mentionSuggestions: List<String>,
+    val linkPreviews: Map<String, social.waddle.android.data.LinkPreview>,
+    val onRequestLinkPreview: (String) -> Unit,
 )
 
 @Composable
@@ -691,6 +741,8 @@ private fun CompactWorkspaceHome(args: ChatLayoutArgs) {
         items(args.dmConversations, key = DmConversationEntity::peerJid) { conversation ->
             MobileDmRow(
                 conversation = conversation,
+                online = args.presences[conversation.peerJid] == true,
+                muted = "dm:${conversation.peerJid}" in args.mutedConversationKeys,
                 onClick = { args.onSelectDirectMessage(conversation.peerJid) },
             )
         }
@@ -730,17 +782,26 @@ private fun CompactChannelView(args: ChatLayoutArgs) {
             messages = args.messages,
             reactionsByMessageId = args.reactionsByMessageId,
             displayedByMessageId = args.displayedByMessageId,
+            linkPreviews = args.linkPreviews,
             modifier = Modifier.weight(1f),
             onLoadOlder = args.onLoadOlder,
             onDisplayed = args.onDisplayed,
             onEdit = args.onEdit,
             onReact = args.onReact,
             onRetract = args.onRetract,
+            onStartReply = args.onStartReply,
+            onRequestLinkPreview = args.onRequestLinkPreview,
         )
         Composer(
             sending = args.state.sending,
             enabled = args.state.selectedChannelId != null,
             channelName = args.currentChannel?.name,
+            conversationKey = args.state.selectedChannelId.orEmpty(),
+            initialText = args.draftText,
+            replyPreview = args.replyPreview,
+            mentionSuggestions = args.mentionSuggestions,
+            onTextChanged = args.onDraftChange,
+            onClearReply = args.onClearReply,
             onTyping = args.onTyping,
             onSend = args.onSend,
             onAttachmentPicked = args.onAttachmentPicked,
@@ -904,6 +965,8 @@ private fun MobileChannelRow(
 @Composable
 private fun MobileDmRow(
     conversation: DmConversationEntity,
+    online: Boolean,
+    muted: Boolean,
     onClick: () -> Unit,
 ) {
     Row(
@@ -915,15 +978,43 @@ private fun MobileDmRow(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        AvatarInitial(name = conversation.peerUsername)
+        Box {
+            AvatarInitial(name = conversation.peerUsername)
+            if (online) {
+                Surface(
+                    color = LocalWaddleColors.current.presenceOnline,
+                    shape = androidx.compose.foundation.shape.CircleShape,
+                    border =
+                        androidx.compose.foundation.BorderStroke(
+                            2.dp,
+                            MaterialTheme.colorScheme.surface,
+                        ),
+                    modifier =
+                        Modifier
+                            .align(Alignment.BottomEnd)
+                            .size(12.dp),
+                ) {}
+            }
+        }
         Column(Modifier.weight(1f)) {
-            Text(
-                text = conversation.peerUsername,
-                style = MaterialTheme.typography.bodyLarge,
-                fontWeight = FontWeight.SemiBold,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text(
+                    text = conversation.peerUsername,
+                    modifier = Modifier.weight(1f, fill = false),
+                    style = MaterialTheme.typography.bodyLarge,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                if (muted) {
+                    Icon(
+                        imageVector = Icons.Rounded.NotificationsOff,
+                        contentDescription = "Muted",
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(14.dp),
+                    )
+                }
+            }
             Text(
                 text = conversation.lastMessageBody ?: conversation.peerJid,
                 style = MaterialTheme.typography.bodySmall,
@@ -932,7 +1023,7 @@ private fun MobileDmRow(
                 overflow = TextOverflow.Ellipsis,
             )
         }
-        if (conversation.unreadCount > 0) {
+        if (conversation.unreadCount > 0 && !muted) {
             Surface(
                 color = MaterialTheme.colorScheme.primary,
                 contentColor = MaterialTheme.colorScheme.onPrimary,
@@ -1032,6 +1123,15 @@ private fun MobileChannelToolbar(args: ChatLayoutArgs) {
                 Icon(Icons.Rounded.MoreVert, contentDescription = "Channel options")
             }
             DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                val muted = args.currentChannel?.let { channel -> channel.roomJid in args.mutedRoomJids } == true
+                DropdownMenuItem(
+                    text = { Text(if (muted) "Unmute channel" else "Mute channel") },
+                    onClick = {
+                        menuOpen = false
+                        args.currentChannel?.roomJid?.let(args.onToggleRoomMute)
+                    },
+                    enabled = args.currentChannel != null,
+                )
                 DropdownMenuItem(
                     text = { Text("Channel settings") },
                     onClick = {
@@ -1097,17 +1197,26 @@ private fun WideChatLayout(args: ChatLayoutArgs) {
                 messages = args.messages,
                 reactionsByMessageId = args.reactionsByMessageId,
                 displayedByMessageId = args.displayedByMessageId,
+                linkPreviews = args.linkPreviews,
                 modifier = Modifier.weight(1f),
                 onLoadOlder = args.onLoadOlder,
                 onDisplayed = args.onDisplayed,
                 onEdit = args.onEdit,
                 onReact = args.onReact,
                 onRetract = args.onRetract,
+                onStartReply = args.onStartReply,
+                onRequestLinkPreview = args.onRequestLinkPreview,
             )
             Composer(
                 sending = args.state.sending,
                 enabled = args.state.selectedChannelId != null,
                 channelName = args.currentChannel?.name,
+                conversationKey = args.state.selectedChannelId.orEmpty(),
+                initialText = args.draftText,
+                replyPreview = args.replyPreview,
+                mentionSuggestions = args.mentionSuggestions,
+                onTextChanged = args.onDraftChange,
+                onClearReply = args.onClearReply,
                 onTyping = args.onTyping,
                 onSend = args.onSend,
                 onAttachmentPicked = args.onAttachmentPicked,
@@ -1422,62 +1531,222 @@ private fun SearchBar(
 }
 
 @Composable
+@OptIn(ExperimentalMaterial3Api::class)
 private fun Timeline(
     session: AuthSession,
     messages: List<MessageEntity>,
     reactionsByMessageId: Map<String, List<ReactionSummary>>,
     displayedByMessageId: Map<String, DeliverySummary>,
+    linkPreviews: Map<String, social.waddle.android.data.LinkPreview>,
     modifier: Modifier = Modifier,
     onLoadOlder: () -> Unit,
     onDisplayed: (String) -> Unit,
     onEdit: (String, String) -> Unit,
     onReact: (String, String) -> Unit,
     onRetract: (String) -> Unit,
+    onStartReply: (MessageEntity) -> Unit,
+    onRequestLinkPreview: (String) -> Unit,
 ) {
     val listState = rememberLazyListState()
-    val latestReadable = messages.lastOrNull { it.senderId != session.stored.userId && !it.retracted }
+    val scope = rememberCoroutineScope()
+    val atBottom by remember {
+        derivedStateOf {
+            val lastVisible =
+                listState.layoutInfo.visibleItemsInfo
+                    .lastOrNull()
+                    ?.index ?: -1
+            lastVisible >= messages.lastIndex.coerceAtLeast(0)
+        }
+    }
+
+    TimelineAutoScrollEffects(
+        messages = messages,
+        listState = listState,
+        atBottom = atBottom,
+        sessionUserId = session.stored.userId,
+        onDisplayed = onDisplayed,
+    )
+
+    Box(modifier = modifier.fillMaxWidth()) {
+        TimelinePullRefreshList(
+            listState = listState,
+            messages = messages,
+            reactionsByMessageId = reactionsByMessageId,
+            displayedByMessageId = displayedByMessageId,
+            session = session,
+            linkPreviews = linkPreviews,
+            onLoadOlder = onLoadOlder,
+            onEdit = onEdit,
+            onReact = onReact,
+            onRetract = onRetract,
+            onStartReply = onStartReply,
+            onRequestLinkPreview = onRequestLinkPreview,
+        )
+        if (!atBottom && messages.isNotEmpty()) {
+            JumpToLatestButton(
+                modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 16.dp),
+                onClick = { scope.launch { listState.animateScrollToItem(messages.lastIndex) } },
+            )
+        }
+    }
+}
+
+@Composable
+private fun TimelineAutoScrollEffects(
+    messages: List<MessageEntity>,
+    listState: androidx.compose.foundation.lazy.LazyListState,
+    atBottom: Boolean,
+    sessionUserId: String,
+    onDisplayed: (String) -> Unit,
+) {
+    val latestReadable = messages.lastOrNull { it.senderId != sessionUserId && !it.retracted }
     LaunchedEffect(messages.lastOrNull()?.id) {
-        if (messages.isNotEmpty()) {
+        if (messages.isNotEmpty() && atBottom) {
             listState.animateScrollToItem(messages.lastIndex)
         }
     }
     LaunchedEffect(latestReadable?.id) {
         latestReadable?.messageKey?.let(onDisplayed)
     }
-    LazyColumn(
-        state = listState,
-        modifier = modifier.fillMaxWidth(),
-        contentPadding = PaddingValues(16.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp),
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun TimelinePullRefreshList(
+    listState: androidx.compose.foundation.lazy.LazyListState,
+    messages: List<MessageEntity>,
+    reactionsByMessageId: Map<String, List<ReactionSummary>>,
+    displayedByMessageId: Map<String, DeliverySummary>,
+    session: AuthSession,
+    linkPreviews: Map<String, social.waddle.android.data.LinkPreview>,
+    onLoadOlder: () -> Unit,
+    onEdit: (String, String) -> Unit,
+    onReact: (String, String) -> Unit,
+    onRetract: (String) -> Unit,
+    onStartReply: (MessageEntity) -> Unit,
+    onRequestLinkPreview: (String) -> Unit,
+) {
+    var pullRefreshing by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+    val pullState = rememberPullToRefreshState()
+    val parentLookup = remember(messages) { messages.associateBy { it.serverId ?: it.id } }
+    PullToRefreshBox(
+        isRefreshing = pullRefreshing,
+        onRefresh = {
+            pullRefreshing = true
+            onLoadOlder()
+            // No completion signal from the MAM fetch, so we drop the spinner
+            // after a short window. New messages animate in independently.
+            scope.launch {
+                kotlinx.coroutines.delay(PULL_REFRESH_LINGER_MILLIS)
+                pullRefreshing = false
+            }
+        },
+        state = pullState,
+        modifier = Modifier.fillMaxSize(),
     ) {
-        if (messages.isNotEmpty()) {
-            item {
-                TextButton(
-                    onClick = onLoadOlder,
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Text("Load older messages")
-                }
+        LazyColumn(
+            state = listState,
+            modifier = Modifier.fillMaxSize(),
+            contentPadding = PaddingValues(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            if (messages.isEmpty()) {
+                item { EmptyState("No messages yet") }
+            }
+            items(messages, key = MessageEntity::id) { message ->
+                TimelineMessageItem(
+                    message = message,
+                    parentLookup = parentLookup,
+                    reactionsByMessageId = reactionsByMessageId,
+                    displayedByMessageId = displayedByMessageId,
+                    session = session,
+                    linkPreviews = linkPreviews,
+                    onEdit = onEdit,
+                    onReact = onReact,
+                    onRetract = onRetract,
+                    onStartReply = onStartReply,
+                    onRequestLinkPreview = onRequestLinkPreview,
+                )
             }
         }
-        if (messages.isEmpty()) {
-            item { EmptyState("No messages yet") }
-        }
-        items(messages, key = MessageEntity::id) { message ->
-            val messageReactions =
-                reactionsByMessageId[message.id].orEmpty() + reactionsByMessageId[message.serverId].orEmpty()
-            MessageRow(
-                session = session,
-                message = message,
-                reactions = messageReactions.distinctBy { it.emoji },
-                displayedCount =
-                    displayedByMessageId[message.id]?.count
-                        ?: message.serverId?.let { displayedByMessageId[it]?.count }
-                        ?: 0,
-                own = message.senderId == session.stored.userId,
-                onEdit = { body -> onEdit(message.messageKey, body) },
-                onReact = { emoji -> onReact(message.messageKey, emoji) },
-                onRetract = { onRetract(message.messageKey) },
+    }
+}
+
+@Composable
+private fun TimelineMessageItem(
+    message: MessageEntity,
+    parentLookup: Map<String, MessageEntity>,
+    reactionsByMessageId: Map<String, List<ReactionSummary>>,
+    displayedByMessageId: Map<String, DeliverySummary>,
+    session: AuthSession,
+    linkPreviews: Map<String, social.waddle.android.data.LinkPreview>,
+    onEdit: (String, String) -> Unit,
+    onReact: (String, String) -> Unit,
+    onRetract: (String) -> Unit,
+    onStartReply: (MessageEntity) -> Unit,
+    onRequestLinkPreview: (String) -> Unit,
+) {
+    val messageReactions =
+        reactionsByMessageId[message.id].orEmpty() +
+            reactionsByMessageId[message.serverId].orEmpty()
+    val parent = message.replyToMessageId?.let { parentLookup[it] }
+    MessageRow(
+        session = session,
+        message = message,
+        parentMessage = parent,
+        reactions = messageReactions.distinctBy { it.emoji },
+        displayedCount =
+            displayedByMessageId[message.id]?.count
+                ?: message.serverId?.let { displayedByMessageId[it]?.count }
+                ?: 0,
+        own = message.senderId == session.stored.userId,
+        linkPreviews = linkPreviews,
+        onEdit = { body -> onEdit(message.messageKey, body) },
+        onReact = { emoji -> onReact(message.messageKey, emoji) },
+        onRetract = { onRetract(message.messageKey) },
+        onStartReply = { onStartReply(message) },
+        onRequestLinkPreview = onRequestLinkPreview,
+    )
+}
+
+@Composable
+private fun JumpToLatestButton(
+    modifier: Modifier,
+    onClick: () -> Unit,
+) {
+    ExtendedFloatingActionButton(
+        onClick = onClick,
+        modifier = modifier,
+        containerColor = MaterialTheme.colorScheme.primary,
+        contentColor = MaterialTheme.colorScheme.onPrimary,
+    ) {
+        Icon(imageVector = Icons.Rounded.KeyboardArrowDown, contentDescription = null)
+        Text("Jump to latest")
+    }
+}
+
+private const val PULL_REFRESH_LINGER_MILLIS = 600L
+
+@Composable
+private fun QuotedParent(parent: MessageEntity) {
+    Surface(
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+        shape = RoundedCornerShape(8.dp),
+        modifier = Modifier.padding(bottom = 6.dp),
+    ) {
+        Column(modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)) {
+            Text(
+                text = parent.senderName ?: "unknown",
+                style = MaterialTheme.typography.labelSmall,
+                fontWeight = FontWeight.SemiBold,
+            )
+            Text(
+                text = parent.body,
+                style = MaterialTheme.typography.bodySmall,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
             )
         }
     }
@@ -1487,12 +1756,16 @@ private fun Timeline(
 private fun MessageRow(
     session: AuthSession,
     message: MessageEntity,
+    parentMessage: MessageEntity?,
     reactions: List<ReactionSummary>,
     displayedCount: Int,
     own: Boolean,
+    linkPreviews: Map<String, social.waddle.android.data.LinkPreview>,
     onEdit: (String) -> Unit,
     onReact: (String) -> Unit,
     onRetract: () -> Unit,
+    onStartReply: () -> Unit,
+    onRequestLinkPreview: (String) -> Unit,
 ) {
     var editing by rememberSaveable(message.id) { mutableStateOf(false) }
     var editBody by rememberSaveable(message.id) { mutableStateOf(message.body) }
@@ -1543,13 +1816,20 @@ private fun MessageRow(
                     },
                 )
             } else {
+                parentMessage?.let { QuotedParent(it) }
                 MessageBody(body = message.body)
-                MessageExtras(message = message)
+                val previewUrl = remember(message.body) { firstWebUrl(message.body) }
+                MessageExtras(
+                    message = message,
+                    linkPreview = previewUrl?.let { linkPreviews[it] },
+                    onRequestLinkPreview = onRequestLinkPreview,
+                )
                 ReactionStrip(reactions = reactions, onReact = onReact)
                 MessageActionRow(
                     own = own,
                     pending = message.pending,
                     onStartEdit = { editing = true },
+                    onStartReply = onStartReply,
                     onReact = onReact,
                     onRetract = onRetract,
                 )
@@ -1559,7 +1839,11 @@ private fun MessageRow(
 }
 
 @Composable
-private fun MessageExtras(message: MessageEntity) {
+private fun MessageExtras(
+    message: MessageEntity,
+    linkPreview: social.waddle.android.data.LinkPreview?,
+    onRequestLinkPreview: (String) -> Unit,
+) {
     val uriHandler = LocalUriHandler.current
     message.broadcastMention?.let { mention ->
         AssistChip(
@@ -1569,17 +1853,25 @@ private fun MessageExtras(message: MessageEntity) {
         )
     }
     message.sharedFileUrl?.let { url ->
-        AssistChip(
-            onClick = { uriHandler.openUri(url) },
-            label = {
-                Text(
-                    text = message.sharedFileName ?: message.sharedFileDescription ?: url,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            },
-            modifier = Modifier.padding(top = 6.dp),
-        )
+        if (message.sharedFileMediaType?.startsWith("image/") == true) {
+            InlineImageAttachment(
+                url = url,
+                description = message.sharedFileDescription ?: message.sharedFileName,
+                onOpen = { uriHandler.openUri(url) },
+            )
+        } else {
+            AssistChip(
+                onClick = { uriHandler.openUri(url) },
+                label = {
+                    Text(
+                        text = message.sharedFileName ?: message.sharedFileDescription ?: url,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                },
+                modifier = Modifier.padding(top = 6.dp),
+            )
+        }
     }
     message.callInviteId?.let {
         AssistChip(
@@ -1602,6 +1894,111 @@ private fun MessageExtras(message: MessageEntity) {
             style = MaterialTheme.typography.labelMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(top = 6.dp),
+        )
+    }
+    // Only try to preview URLs in plain prose — skip if the message already
+    // has a shared-file attachment that rendered an inline preview above.
+    if (message.sharedFileUrl == null && !message.isSticker) {
+        val firstUrl = remember(message.body) { firstWebUrl(message.body) }
+        if (firstUrl != null) {
+            LaunchedEffect(firstUrl) { onRequestLinkPreview(firstUrl) }
+            linkPreview?.let { preview ->
+                LinkPreviewCard(preview = preview, onOpen = { uriHandler.openUri(firstUrl) })
+            }
+        }
+    }
+}
+
+@Composable
+private fun LinkPreviewCard(
+    preview: social.waddle.android.data.LinkPreview,
+    onOpen: () -> Unit,
+) {
+    Surface(
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+        shape = RoundedCornerShape(12.dp),
+        modifier =
+            Modifier
+                .padding(top = 6.dp)
+                .fillMaxWidth()
+                .clickable(onClick = onOpen),
+    ) {
+        Column(modifier = Modifier.padding(12.dp)) {
+            preview.imageUrl?.let { image ->
+                coil.compose.AsyncImage(
+                    model = image,
+                    contentDescription = preview.title ?: "Link preview image",
+                    modifier =
+                        Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 180.dp)
+                            .padding(bottom = 8.dp),
+                    contentScale = androidx.compose.ui.layout.ContentScale.Crop,
+                )
+            }
+            preview.siteName?.let { site ->
+                Text(
+                    text = site,
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            preview.title?.let { title ->
+                Text(
+                    text = title,
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.padding(top = 2.dp),
+                )
+            }
+            preview.description?.let { desc ->
+                Text(
+                    text = desc,
+                    style = MaterialTheme.typography.bodySmall,
+                    maxLines = 3,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.padding(top = 2.dp),
+                )
+            }
+        }
+    }
+}
+
+private fun firstWebUrl(body: String): String? {
+    val match = WEB_URL_PATTERN.find(body) ?: return null
+    return match.value.trim().trimEnd(',', '.', ')', '!', '?')
+}
+
+private val WEB_URL_PATTERN = Regex("""https?://[^\s<>"']+""")
+
+@Composable
+private fun InlineImageAttachment(
+    url: String,
+    description: String?,
+    onOpen: () -> Unit,
+) {
+    Surface(
+        modifier =
+            Modifier
+                .padding(top = 6.dp)
+                .fillMaxWidth(fraction = 0.8f)
+                .clickable(onClick = onOpen),
+        shape = RoundedCornerShape(12.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant,
+    ) {
+        coil.compose.AsyncImage(
+            model = url,
+            contentDescription = description ?: "Image attachment",
+            modifier =
+                Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 240.dp),
+            contentScale = androidx.compose.ui.layout.ContentScale.Fit,
         )
     }
 }
@@ -1741,6 +2138,7 @@ private fun MessageActionRow(
     own: Boolean,
     pending: Boolean,
     onStartEdit: () -> Unit,
+    onStartReply: () -> Unit,
     onReact: (String) -> Unit,
     onRetract: () -> Unit,
 ) {
@@ -1757,6 +2155,12 @@ private fun MessageActionRow(
             ) {
                 Text(emoji)
             }
+        }
+        IconButton(onClick = onStartReply, enabled = !pending) {
+            Icon(
+                imageVector = Icons.AutoMirrored.Filled.Reply,
+                contentDescription = "Reply",
+            )
         }
         Spacer(Modifier.weight(1f))
         if (own) {
@@ -1802,14 +2206,103 @@ private fun Composer(
     sending: Boolean,
     enabled: Boolean,
     channelName: String?,
+    conversationKey: String,
+    initialText: String,
+    replyPreview: ReplyPreview?,
+    mentionSuggestions: List<String> = emptyList(),
+    onTextChanged: (String) -> Unit,
+    onClearReply: () -> Unit,
     onTyping: (Boolean) -> Unit,
     onSend: (String) -> Unit,
     onAttachmentPicked: (Uri, String?, String?) -> Unit,
 ) {
-    var body by rememberSaveable { mutableStateOf("") }
-    var composing by rememberSaveable { mutableStateOf(false) }
+    // Key on conversationKey (channelId or peerJid) — NOT initialText — so the
+    // draft flow echoing our own writes back doesn't reset local state and
+    // race the user's keystrokes. initialText is only consulted when the
+    // conversation first loads its draft (see LaunchedEffect below).
+    var body by rememberSaveable(conversationKey) { mutableStateOf(initialText) }
+    var composing by rememberSaveable(conversationKey) { mutableStateOf(false) }
+    LaunchedEffect(conversationKey, initialText) {
+        if (body.isEmpty() && initialText.isNotEmpty()) {
+            body = initialText
+        }
+    }
     val placeholder = channelName?.let { "Message #$it" } ?: "Message"
+    val mentionToken = remember(body) { trailingMentionToken(body) }
+    val filteredMentions = filteredMentionsFor(mentionToken, mentionSuggestions)
+    val state =
+        ComposerState(
+            body = body,
+            composing = composing,
+            enabled = enabled,
+            sending = sending,
+            placeholder = placeholder,
+            onBodyChange = { next ->
+                body = next
+                onTextChanged(next)
+                val nextComposing = next.isNotBlank()
+                if (nextComposing != composing) {
+                    composing = nextComposing
+                    onTyping(nextComposing)
+                }
+            },
+            onSend = { trimmed ->
+                onSend(trimmed)
+                body = ""
+                if (composing) {
+                    composing = false
+                    onTyping(false)
+                }
+            },
+        )
+
+    Column(Modifier.fillMaxWidth()) {
+        if (filteredMentions.isNotEmpty() && mentionToken != null) {
+            MentionSuggestionStrip(
+                suggestions = filteredMentions,
+                onSelect = { pick ->
+                    val replaced = replaceTrailingMention(body, pick)
+                    body = replaced
+                    onTextChanged(replaced)
+                },
+            )
+        }
+        replyPreview?.let { ReplyPreviewCard(preview = it, onClose = onClearReply) }
+        ComposerRow(state = state, onAttachmentPicked = onAttachmentPicked)
+    }
+}
+
+private data class ComposerState(
+    val body: String,
+    val composing: Boolean,
+    val enabled: Boolean,
+    val sending: Boolean,
+    val placeholder: String,
+    val onBodyChange: (String) -> Unit,
+    val onSend: (String) -> Unit,
+)
+
+@Composable
+private fun filteredMentionsFor(
+    mentionToken: String?,
+    mentionSuggestions: List<String>,
+): List<String> =
+    remember(mentionToken, mentionSuggestions) {
+        mentionToken
+            ?.let { token ->
+                mentionSuggestions
+                    .filter { name -> name.contains(token, ignoreCase = true) }
+                    .take(MAX_MENTION_SUGGESTIONS)
+            }.orEmpty()
+    }
+
+@Composable
+private fun ComposerRow(
+    state: ComposerState,
+    onAttachmentPicked: (Uri, String?, String?) -> Unit,
+) {
     val context = LocalContext.current
+    val haptics = androidx.compose.ui.platform.LocalHapticFeedback.current
     val attachmentLauncher =
         rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
             if (uri != null) {
@@ -1817,51 +2310,144 @@ private fun Composer(
                 onAttachmentPicked(attachment.uri, attachment.name, attachment.mimeType)
             }
         }
-
+    val ready = state.enabled && !state.sending
     Row(
-        modifier =
-            Modifier
-                .fillMaxWidth()
-                .padding(12.dp),
+        modifier = Modifier.fillMaxWidth().padding(12.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         OutlinedTextField(
-            value = body,
-            onValueChange = { next ->
-                body = next
-                val nextComposing = next.isNotBlank()
-                if (nextComposing != composing) {
-                    composing = nextComposing
-                    onTyping(nextComposing)
-                }
-            },
-            enabled = enabled && !sending,
+            value = state.body,
+            onValueChange = state.onBodyChange,
+            enabled = ready,
             modifier = Modifier.weight(1f),
-            placeholder = { Text(placeholder) },
+            placeholder = { Text(state.placeholder) },
             maxLines = 5,
         )
         IconButton(
             onClick = { attachmentLauncher.launch(arrayOf("*/*")) },
-            enabled = enabled && !sending,
+            enabled = ready,
         ) {
             Icon(Icons.Rounded.AttachFile, contentDescription = "Attach file")
         }
         IconButton(
             onClick = {
-                val trimmed = body.trim()
-                if (trimmed.isNotEmpty()) {
-                    onSend(trimmed)
-                    body = ""
-                    if (composing) {
-                        composing = false
-                        onTyping(false)
-                    }
-                }
+                val trimmed = state.body.trim()
+                if (trimmed.isEmpty()) return@IconButton
+                haptics.performHapticFeedback(
+                    androidx.compose.ui.hapticfeedback.HapticFeedbackType.LongPress,
+                )
+                state.onSend(trimmed)
             },
-            enabled = enabled && !sending && body.isNotBlank(),
+            enabled = ready && state.body.isNotBlank(),
         ) {
             Icon(Icons.AutoMirrored.Rounded.Send, contentDescription = "Send")
+        }
+    }
+}
+
+data class ReplyPreview(
+    val senderName: String,
+    val body: String,
+)
+
+private const val MAX_MENTION_SUGGESTIONS = 6
+
+/**
+ * If the last whitespace-delimited token of [body] starts with `@`, returns the
+ * query portion after the `@`. Otherwise null — no mention is being composed.
+ */
+private fun trailingMentionToken(body: String): String? {
+    if (body.isBlank()) return null
+    val tail = body.substringAfterLast(' ').substringAfterLast('\n')
+    if (!tail.startsWith('@')) return null
+    val query = tail.drop(1)
+    // Don't trigger for pure '@' with no letters yet — still trigger, but only
+    // if the tail is short-ish. Keeps the popup from firing on '@http://...' URLs.
+    if (query.length > 32) return null
+    return query
+}
+
+private fun replaceTrailingMention(
+    body: String,
+    chosen: String,
+): String {
+    val lastSpace = maxOf(body.lastIndexOf(' '), body.lastIndexOf('\n'))
+    val prefix = if (lastSpace >= 0) body.substring(0, lastSpace + 1) else ""
+    return "$prefix@$chosen "
+}
+
+@Composable
+private fun MentionSuggestionStrip(
+    suggestions: List<String>,
+    onSelect: (String) -> Unit,
+) {
+    Surface(
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier =
+            Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 4.dp),
+        shape = RoundedCornerShape(12.dp),
+    ) {
+        Column(Modifier.padding(vertical = 4.dp)) {
+            suggestions.forEach { name ->
+                Row(
+                    modifier =
+                        Modifier
+                            .fillMaxWidth()
+                            .clickable { onSelect(name) }
+                            .padding(horizontal = 12.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    AvatarInitial(name = name)
+                    Text(
+                        text = "@$name",
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ReplyPreviewCard(
+    preview: ReplyPreview,
+    onClose: () -> Unit,
+) {
+    Surface(
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+        shape = RoundedCornerShape(12.dp),
+        modifier =
+            Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 6.dp),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text(
+                    text = "Replying to ${preview.senderName}",
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Text(
+                    text = preview.body,
+                    style = MaterialTheme.typography.bodySmall,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            IconButton(onClick = onClose) {
+                Icon(Icons.Rounded.Close, contentDescription = "Cancel reply")
+            }
         }
     }
 }
