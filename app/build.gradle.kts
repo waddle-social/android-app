@@ -16,15 +16,36 @@ android {
     compileSdk = 36
 
     signingConfigs {
-        create("ciRelease") {
-            storeFile =
-                rootProject.layout.buildDirectory
-                    .file("ci/waddle-ci-release.keystore")
-                    .get()
-                    .asFile
-            storePassword = "android"
-            keyAlias = "waddle-ci-release"
-            keyPassword = "android"
+        // Configured dynamically from env vars in CI:
+        //  - RELEASE_KEYSTORE_PATH: absolute path to the decoded .keystore
+        //  - RELEASE_KEYSTORE_PASSWORD / RELEASE_KEY_ALIAS / RELEASE_KEY_PASSWORD
+        // When any of these are missing we fall back to a throwaway keystore at
+        // build/ci/waddle-ci-release.keystore so local CI smoke-tests still work.
+        create("release") {
+            val envKeystorePath = providers.environmentVariable("RELEASE_KEYSTORE_PATH").orNull
+            val envStorePassword = providers.environmentVariable("RELEASE_KEYSTORE_PASSWORD").orNull
+            val envKeyAlias = providers.environmentVariable("RELEASE_KEY_ALIAS").orNull
+            val envKeyPassword = providers.environmentVariable("RELEASE_KEY_PASSWORD").orNull
+            val hasRealKey =
+                !envKeystorePath.isNullOrBlank() &&
+                    !envStorePassword.isNullOrBlank() &&
+                    !envKeyAlias.isNullOrBlank() &&
+                    !envKeyPassword.isNullOrBlank()
+            if (hasRealKey) {
+                storeFile = file(envKeystorePath!!)
+                storePassword = envStorePassword
+                keyAlias = envKeyAlias
+                keyPassword = envKeyPassword
+            } else {
+                storeFile =
+                    rootProject.layout.buildDirectory
+                        .file("ci/waddle-ci-release.keystore")
+                        .get()
+                        .asFile
+                storePassword = "android"
+                keyAlias = "waddle-ci-release"
+                keyPassword = "android"
+            }
         }
     }
 
@@ -55,7 +76,7 @@ android {
         release {
             isMinifyEnabled = true
             if (providers.environmentVariable("CI").isPresent) {
-                signingConfig = signingConfigs.getByName("ciRelease")
+                signingConfig = signingConfigs.getByName("release")
             }
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
