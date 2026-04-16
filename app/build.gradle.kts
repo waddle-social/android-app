@@ -13,7 +13,7 @@ plugins {
 
 android {
     namespace = "social.waddle.android"
-    compileSdk = 36
+    compileSdk = 37
 
     signingConfigs {
         // Configured dynamically from env vars in CI:
@@ -52,7 +52,7 @@ android {
     defaultConfig {
         applicationId = "social.waddle.android"
         minSdk = 26
-        targetSdk = 36
+        targetSdk = 37
         val baseVersionName = "0.1.0"
         val runNumber = providers.environmentVariable("VERSION_CODE").orNull?.toIntOrNull() ?: 1
         val versionSuffix = providers.environmentVariable("VERSION_SUFFIX").orNull
