@@ -4,6 +4,7 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.isSystemInDarkTheme
 import dagger.hilt.android.AndroidEntryPoint
 import social.waddle.android.ui.WaddleApp
 import social.waddle.android.ui.theme.WaddleTheme
@@ -14,7 +15,7 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
         setContent {
-            WaddleTheme {
+            WaddleTheme(darkTheme = isSystemInDarkTheme()) {
                 WaddleApp()
             }
         }
