@@ -5,6 +5,7 @@ import android.content.res.Configuration
 import android.database.Cursor
 import android.net.Uri
 import android.provider.OpenableColumns
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -23,33 +24,44 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.automirrored.rounded.Send
-import androidx.compose.material.icons.rounded.AccountCircle
+import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.AttachFile
+import androidx.compose.material.icons.rounded.ChatBubbleOutline
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.Delete
 import androidx.compose.material.icons.rounded.Done
 import androidx.compose.material.icons.rounded.Edit
+import androidx.compose.material.icons.rounded.Home
+import androidx.compose.material.icons.rounded.MoreVert
+import androidx.compose.material.icons.rounded.Person
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Search
+import androidx.compose.material.icons.rounded.Tag
 import androidx.compose.material.icons.rounded.Warning
 import androidx.compose.material3.AssistChip
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.NavigationBarItemDefaults
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.VerticalDivider
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -81,6 +93,7 @@ import social.waddle.android.data.db.MessageEntity
 import social.waddle.android.data.db.ReactionSummary
 import social.waddle.android.data.db.WaddleEntity
 import social.waddle.android.data.model.AuthSession
+import social.waddle.android.ui.theme.LocalWaddleColors
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
@@ -133,15 +146,30 @@ fun ChatScreen(
         session = session,
         state = state,
         waddles = waddles,
-        channels = channels,
         onStart = viewModel::start,
         onSelectWaddle = { viewModel.selectWaddle(session, it) },
-        onSelectChannel = viewModel::selectChannel,
     )
+
+    val currentWaddle = waddles.firstOrNull { it.id == state.selectedWaddleId }
+    val currentChannel = channels.firstOrNull { it.id == state.selectedChannelId }
+    val insideChannel = compact && state.mode == ChatMode.Rooms && state.selectedChannelId != null
+    val insideDm = compact && state.mode == ChatMode.DirectMessages && state.selectedDmPeerJid != null
+    val showBack = insideChannel || insideDm
+    val backAction: (() -> Unit)? =
+        when {
+            insideChannel -> viewModel::clearSelectedChannel
+            insideDm -> viewModel::clearDirectMessageSelection
+            else -> null
+        }
+    BackHandler(enabled = showBack) { backAction?.invoke() }
 
     ChatScreenScaffold(
         session = session,
         state = state,
+        compact = compact,
+        currentWaddleName = currentWaddle?.name,
+        currentChannelName = currentChannel?.name.takeIf { insideChannel },
+        onBack = backAction,
         onOpenAccount = onOpenAccount,
         onShowRooms = viewModel::showRooms,
         onShowDirectMessages = viewModel::showDirectMessages,
@@ -168,6 +196,10 @@ fun ChatScreen(
 private fun ChatScreenScaffold(
     session: AuthSession,
     state: ChatUiState,
+    compact: Boolean,
+    currentWaddleName: String?,
+    currentChannelName: String?,
+    onBack: (() -> Unit)?,
     onOpenAccount: () -> Unit,
     onShowRooms: () -> Unit,
     onShowDirectMessages: () -> Unit,
@@ -177,38 +209,189 @@ private fun ChatScreenScaffold(
 ) {
     Scaffold(
         topBar = {
-            TopAppBar(
-                title = {
-                    Column {
-                        Text("Waddle")
-                        Text(
-                            session.jid,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                    }
-                },
-                actions = {
-                    TextButton(onClick = onShowRooms, enabled = state.mode != ChatMode.Rooms) {
-                        Text("Rooms")
-                    }
-                    TextButton(onClick = onShowDirectMessages, enabled = state.mode != ChatMode.DirectMessages) {
-                        Text("DMs")
-                    }
-                    IconButton(onClick = onRefresh) {
-                        Icon(Icons.Rounded.Refresh, contentDescription = "Refresh")
-                    }
-                    IconButton(onClick = onOpenAccount) {
-                        Icon(Icons.Rounded.AccountCircle, contentDescription = "Account")
-                    }
-                },
+            ChatTopBar(
+                session = session,
+                compact = compact,
+                mode = state.mode,
+                currentWaddleName = currentWaddleName,
+                currentChannelName = currentChannelName,
+                onBack = onBack,
+                onRefresh = onRefresh,
+                onOpenAccount = onOpenAccount,
             )
+        },
+        bottomBar = {
+            if (compact) {
+                ChatBottomBar(
+                    mode = state.mode,
+                    channelSelected = state.selectedChannelId != null,
+                    onShowRooms = onShowRooms,
+                    onShowDirectMessages = onShowDirectMessages,
+                    onOpenAccount = onOpenAccount,
+                )
+            }
         },
         snackbarHost = snackbarHost,
         content = content,
     )
+}
+
+private data class TopBarLabels(
+    val title: String,
+    val subtitle: String,
+)
+
+private fun topBarLabels(
+    session: AuthSession,
+    compact: Boolean,
+    mode: ChatMode,
+    currentWaddleName: String?,
+    currentChannelName: String?,
+): TopBarLabels {
+    val fallbackWaddle = currentWaddleName ?: "Waddle"
+    if (!compact) {
+        return TopBarLabels(title = fallbackWaddle, subtitle = session.jid)
+    }
+    return when (mode) {
+        ChatMode.Rooms -> {
+            if (currentChannelName != null) {
+                TopBarLabels(
+                    title = "#$currentChannelName",
+                    subtitle = currentWaddleName ?: session.jid,
+                )
+            } else {
+                TopBarLabels(title = fallbackWaddle, subtitle = session.displayName)
+            }
+        }
+
+        ChatMode.DirectMessages -> {
+            TopBarLabels(title = "Direct messages", subtitle = session.displayName)
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ChatTopBar(
+    session: AuthSession,
+    compact: Boolean,
+    mode: ChatMode,
+    currentWaddleName: String?,
+    currentChannelName: String?,
+    onBack: (() -> Unit)?,
+    onRefresh: () -> Unit,
+    onOpenAccount: () -> Unit,
+) {
+    val labels = topBarLabels(session, compact, mode, currentWaddleName, currentChannelName)
+    TopAppBar(
+        colors =
+            TopAppBarDefaults.topAppBarColors(
+                containerColor = MaterialTheme.colorScheme.surface,
+                scrolledContainerColor = MaterialTheme.colorScheme.surface,
+            ),
+        title = { ChatTopBarTitle(labels = labels) },
+        navigationIcon = { ChatTopBarBack(onBack = onBack) },
+        actions = { ChatTopBarActions(compact = compact, session = session, onRefresh = onRefresh, onOpenAccount = onOpenAccount) },
+    )
+}
+
+@Composable
+private fun ChatTopBarTitle(labels: TopBarLabels) {
+    Column {
+        Text(
+            text = labels.title,
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.Bold,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+        Text(
+            text = labels.subtitle,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
+}
+
+@Composable
+private fun ChatTopBarBack(onBack: (() -> Unit)?) {
+    onBack?.let {
+        IconButton(onClick = it) {
+            Icon(
+                imageVector = Icons.AutoMirrored.Rounded.ArrowBack,
+                contentDescription = "Back",
+            )
+        }
+    }
+}
+
+@Composable
+private fun ChatTopBarActions(
+    compact: Boolean,
+    session: AuthSession,
+    onRefresh: () -> Unit,
+    onOpenAccount: () -> Unit,
+) {
+    if (!compact) {
+        TextButton(onClick = onOpenAccount) {
+            Text(session.displayName, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        }
+    }
+    IconButton(onClick = onRefresh) {
+        Icon(Icons.Rounded.Refresh, contentDescription = "Refresh")
+    }
+}
+
+@Composable
+private fun ChatBottomBar(
+    mode: ChatMode,
+    channelSelected: Boolean,
+    onShowRooms: () -> Unit,
+    onShowDirectMessages: () -> Unit,
+    onOpenAccount: () -> Unit,
+) {
+    val colors = LocalWaddleColors.current
+    NavigationBar(
+        containerColor = MaterialTheme.colorScheme.surface,
+        tonalElevation = 0.dp,
+    ) {
+        val itemColors =
+            NavigationBarItemDefaults.colors(
+                selectedIconColor = MaterialTheme.colorScheme.primary,
+                selectedTextColor = MaterialTheme.colorScheme.primary,
+                indicatorColor = MaterialTheme.colorScheme.primaryContainer,
+                unselectedIconColor = colors.sidebarMuted,
+                unselectedTextColor = colors.sidebarMuted,
+            )
+        NavigationBarItem(
+            selected = mode == ChatMode.Rooms,
+            onClick = onShowRooms,
+            icon = {
+                Icon(
+                    imageVector = if (mode == ChatMode.Rooms && channelSelected) Icons.Rounded.Tag else Icons.Rounded.Home,
+                    contentDescription = "Home",
+                )
+            },
+            label = { Text("Home") },
+            colors = itemColors,
+        )
+        NavigationBarItem(
+            selected = mode == ChatMode.DirectMessages,
+            onClick = onShowDirectMessages,
+            icon = { Icon(Icons.Rounded.ChatBubbleOutline, contentDescription = "DMs") },
+            label = { Text("DMs") },
+            colors = itemColors,
+        )
+        NavigationBarItem(
+            selected = false,
+            onClick = onOpenAccount,
+            icon = { Icon(Icons.Rounded.Person, contentDescription = "You") },
+            label = { Text("You") },
+            colors = itemColors,
+        )
+    }
 }
 
 @Composable
@@ -406,10 +589,8 @@ private fun ChatSelectionEffects(
     session: AuthSession,
     state: ChatUiState,
     waddles: List<WaddleEntity>,
-    channels: List<ChannelEntity>,
     onStart: (AuthSession) -> Unit,
     onSelectWaddle: (String) -> Unit,
-    onSelectChannel: (String, String) -> Unit,
 ) {
     LaunchedEffect(session.stored.sessionId) {
         onStart(session)
@@ -417,12 +598,6 @@ private fun ChatSelectionEffects(
     LaunchedEffect(waddles, state.selectedWaddleId) {
         if (state.selectedWaddleId == null && waddles.isNotEmpty()) {
             onSelectWaddle(waddles.first().id)
-        }
-    }
-    LaunchedEffect(channels, state.selectedChannelId) {
-        val selectedWaddleId = state.selectedWaddleId
-        if (selectedWaddleId != null && state.selectedChannelId == null && channels.isNotEmpty()) {
-            onSelectChannel(selectedWaddleId, channels.first().id)
         }
     }
 }
@@ -463,21 +638,82 @@ private data class ChatLayoutArgs(
 
 @Composable
 private fun CompactChatLayout(args: ChatLayoutArgs) {
-    Column(Modifier.fillMaxSize()) {
-        WaddleChips(
-            waddles = args.waddles,
-            selectedWaddleId = args.state.selectedWaddleId,
-            onSelectWaddle = args.onSelectWaddle,
-        )
-        HorizontalDivider()
-        ChannelChips(
-            channels = args.channels,
-            selectedWaddleId = args.state.selectedWaddleId,
-            selectedChannelId = args.state.selectedChannelId,
-            onSelectChannel = args.onSelectChannel,
-        )
-        HorizontalDivider()
-        ChannelHeader(args)
+    if (args.state.selectedChannelId == null) {
+        CompactWorkspaceHome(args)
+    } else {
+        CompactChannelView(args)
+    }
+}
+
+@Composable
+private fun CompactWorkspaceHome(args: ChatLayoutArgs) {
+    val waddleSwitcherOpen = rememberSaveable { mutableStateOf(false) }
+    LazyColumn(
+        modifier =
+            Modifier
+                .fillMaxSize()
+                .background(MaterialTheme.colorScheme.surface),
+        contentPadding = PaddingValues(vertical = 8.dp),
+    ) {
+        item { WorkspaceSwitcherHeader(args, waddleSwitcherOpen) }
+        item { HorizontalDivider(color = LocalWaddleColors.current.divider) }
+        item {
+            MobileSectionHeader(
+                title = "Channels",
+                onAdd = args.onOpenNewChannel.takeIf { args.currentWaddle != null },
+            )
+        }
+        items(args.channels, key = ChannelEntity::id) { channel ->
+            MobileChannelRow(
+                channel = channel,
+                selected = false,
+                onClick = {
+                    args.state.selectedWaddleId?.let { waddleId ->
+                        args.onSelectChannel(waddleId, channel.id)
+                    }
+                },
+            )
+        }
+        if (args.channels.isEmpty() && args.currentWaddle != null) {
+            item { MobileEmptyRow("No channels yet — tap + to create one.") }
+        }
+        item { MobileActionRow(label = "Browse public waddles", onClick = args.onOpenBrowse) }
+        item {
+            Spacer(Modifier.height(8.dp))
+            HorizontalDivider(color = LocalWaddleColors.current.divider)
+        }
+        item {
+            MobileSectionHeader(
+                title = "Direct messages",
+                onAdd = args.onOpenDirectMessages,
+            )
+        }
+        items(args.dmConversations, key = DmConversationEntity::peerJid) { conversation ->
+            MobileDmRow(
+                conversation = conversation,
+                onClick = { args.onSelectDirectMessage(conversation.peerJid) },
+            )
+        }
+        if (args.dmConversations.isEmpty()) {
+            item { MobileEmptyRow("No direct messages yet — tap + to find someone.") }
+        }
+        item {
+            Spacer(Modifier.height(8.dp))
+            HorizontalDivider(color = LocalWaddleColors.current.divider)
+        }
+        item { MobileActionRow(label = "Manage members", onClick = args.onOpenMembers) }
+        item { MobileActionRow(label = "Waddle settings", onClick = args.onOpenWaddleSettings) }
+    }
+}
+
+@Composable
+private fun CompactChannelView(args: ChatLayoutArgs) {
+    Column(
+        Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.background),
+    ) {
+        MobileChannelToolbar(args)
         if (args.state.searchVisible) {
             SearchBar(
                 query = args.state.searchQuery,
@@ -509,6 +745,326 @@ private fun CompactChatLayout(args: ChatLayoutArgs) {
             onSend = args.onSend,
             onAttachmentPicked = args.onAttachmentPicked,
         )
+    }
+}
+
+@Composable
+private fun WorkspaceSwitcherHeader(
+    args: ChatLayoutArgs,
+    expanded: androidx.compose.runtime.MutableState<Boolean>,
+) {
+    val colors = LocalWaddleColors.current
+    Row(
+        modifier =
+            Modifier
+                .fillMaxWidth()
+                .clickable(enabled = args.waddles.size > 1) { expanded.value = !expanded.value }
+                .padding(horizontal = 16.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        WorkspaceBadge(name = args.currentWaddle?.name)
+        Column(Modifier.weight(1f)) {
+            Text(
+                text = args.currentWaddle?.name ?: "Waddle",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                text =
+                    args.currentWaddle?.memberCount?.let { "$it members" }
+                        ?: "Browse and create waddles below",
+                style = MaterialTheme.typography.bodySmall,
+                color = colors.sidebarMuted.takeIf { false } ?: MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        if (args.waddles.size > 1) {
+            IconButton(onClick = { expanded.value = !expanded.value }) {
+                Icon(Icons.Rounded.MoreVert, contentDescription = "Switch waddle")
+            }
+            DropdownMenu(
+                expanded = expanded.value,
+                onDismissRequest = { expanded.value = false },
+            ) {
+                args.waddles.forEach { waddle ->
+                    DropdownMenuItem(
+                        text = { Text(waddle.name) },
+                        onClick = {
+                            expanded.value = false
+                            args.onSelectWaddle(waddle.id)
+                        },
+                    )
+                }
+            }
+        } else {
+            TextButton(onClick = args.onOpenNewWaddle) {
+                Icon(Icons.Rounded.Add, contentDescription = null)
+                Spacer(Modifier.width(4.dp))
+                Text("New")
+            }
+        }
+    }
+}
+
+@Composable
+private fun WorkspaceBadge(name: String?) {
+    val colors = LocalWaddleColors.current
+    Surface(
+        color = colors.sidebar,
+        contentColor = colors.sidebarContent,
+        shape = RoundedCornerShape(10.dp),
+        modifier = Modifier.size(40.dp),
+    ) {
+        Box(contentAlignment = Alignment.Center) {
+            Text(
+                text = name?.firstOrNull()?.uppercaseChar()?.toString() ?: "W",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
+            )
+        }
+    }
+}
+
+@Composable
+private fun MobileSectionHeader(
+    title: String,
+    onAdd: (() -> Unit)?,
+) {
+    Row(
+        modifier =
+            Modifier
+                .fillMaxWidth()
+                .padding(start = 20.dp, end = 8.dp, top = 14.dp, bottom = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = title,
+            modifier = Modifier.weight(1f),
+            style = MaterialTheme.typography.labelLarge,
+            fontWeight = FontWeight.SemiBold,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        onAdd?.let {
+            IconButton(onClick = it) {
+                Icon(Icons.Rounded.Add, contentDescription = "Add")
+            }
+        }
+    }
+}
+
+@Composable
+private fun MobileChannelRow(
+    channel: ChannelEntity,
+    selected: Boolean,
+    onClick: () -> Unit,
+) {
+    val contentColor =
+        if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
+    Row(
+        modifier =
+            Modifier
+                .fillMaxWidth()
+                .clickable(onClick = onClick)
+                .padding(horizontal = 20.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Icon(
+            imageVector = Icons.Rounded.Tag,
+            contentDescription = null,
+            tint = contentColor,
+            modifier = Modifier.size(18.dp),
+        )
+        Text(
+            text = channel.name,
+            modifier = Modifier.weight(1f),
+            style = MaterialTheme.typography.bodyLarge,
+            color = contentColor,
+            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+        channel.topic?.takeIf(String::isNotBlank)?.let { topic ->
+            Text(
+                text = topic,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
+            )
+        }
+    }
+}
+
+@Composable
+private fun MobileDmRow(
+    conversation: DmConversationEntity,
+    onClick: () -> Unit,
+) {
+    Row(
+        modifier =
+            Modifier
+                .fillMaxWidth()
+                .clickable(onClick = onClick)
+                .padding(horizontal = 20.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        AvatarInitial(name = conversation.peerUsername)
+        Column(Modifier.weight(1f)) {
+            Text(
+                text = conversation.peerUsername,
+                style = MaterialTheme.typography.bodyLarge,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                text = conversation.lastMessageBody ?: conversation.peerJid,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        if (conversation.unreadCount > 0) {
+            Surface(
+                color = MaterialTheme.colorScheme.primary,
+                contentColor = MaterialTheme.colorScheme.onPrimary,
+                shape = RoundedCornerShape(10.dp),
+            ) {
+                Text(
+                    text = conversation.unreadCount.toString(),
+                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.Bold,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun MobileActionRow(
+    label: String,
+    onClick: () -> Unit,
+) {
+    Row(
+        modifier =
+            Modifier
+                .fillMaxWidth()
+                .clickable(onClick = onClick)
+                .padding(horizontal = 20.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Icon(
+            imageVector = Icons.Rounded.Add,
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.size(18.dp),
+        )
+        Text(
+            text = label,
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+@Composable
+private fun MobileEmptyRow(text: String) {
+    Text(
+        text = text,
+        modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp),
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+}
+
+@Composable
+private fun MobileChannelToolbar(args: ChatLayoutArgs) {
+    val typers =
+        args.currentChannel
+            ?.roomJid
+            ?.let { roomJid -> args.roomTyping[roomJid].orEmpty() }
+            .orEmpty()
+    var menuOpen by rememberSaveable { mutableStateOf(false) }
+    Surface(
+        color = MaterialTheme.colorScheme.surface,
+        tonalElevation = 0.dp,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            Text(
+                text =
+                    if (typers.isNotEmpty()) {
+                        "${typers.take(TYPING_NAME_LIMIT).joinToString()} typing…"
+                    } else {
+                        args.currentChannel?.topic?.takeIf(String::isNotBlank)
+                            ?: "Channel details"
+                    },
+                modifier = Modifier.weight(1f),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            IconButton(
+                onClick = args.onToggleSearch,
+                enabled = args.currentChannel != null,
+            ) {
+                Icon(
+                    imageVector = if (args.state.searchVisible) Icons.Rounded.Close else Icons.Rounded.Search,
+                    contentDescription = if (args.state.searchVisible) "Close search" else "Search messages",
+                )
+            }
+            IconButton(onClick = { menuOpen = true }) {
+                Icon(Icons.Rounded.MoreVert, contentDescription = "Channel options")
+            }
+            DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                DropdownMenuItem(
+                    text = { Text("Channel settings") },
+                    onClick = {
+                        menuOpen = false
+                        args.onOpenChannelSettings()
+                    },
+                    enabled = args.currentChannel != null,
+                )
+                DropdownMenuItem(
+                    text = { Text("Members") },
+                    onClick = {
+                        menuOpen = false
+                        args.onOpenMembers()
+                    },
+                    enabled = args.currentWaddle != null,
+                )
+                DropdownMenuItem(
+                    text = { Text("New channel") },
+                    onClick = {
+                        menuOpen = false
+                        args.onOpenNewChannel()
+                    },
+                    enabled = args.currentWaddle != null,
+                )
+                DropdownMenuItem(
+                    text = { Text("Browse waddles") },
+                    onClick = {
+                        menuOpen = false
+                        args.onOpenBrowse()
+                    },
+                )
+            }
+        }
     }
 }
 
@@ -565,8 +1121,10 @@ private fun WorkspaceSidebar(
     args: ChatLayoutArgs,
     modifier: Modifier = Modifier,
 ) {
+    val colors = LocalWaddleColors.current
     Surface(
-        color = MaterialTheme.colorScheme.surfaceVariant,
+        color = colors.sidebar,
+        contentColor = colors.sidebarContent,
         modifier = modifier,
     ) {
         LazyColumn(
@@ -621,27 +1179,33 @@ private fun WorkspaceSidebar(
 
 @Composable
 private fun WorkspaceHeader(args: ChatLayoutArgs) {
-    Column(
+    val colors = LocalWaddleColors.current
+    Row(
         modifier =
             Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 16.dp, vertical = 8.dp),
-        verticalArrangement = Arrangement.spacedBy(4.dp),
+                .padding(horizontal = 16.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        Text(
-            text = args.currentWaddle?.name ?: "Waddle",
-            style = MaterialTheme.typography.titleMedium,
-            fontWeight = FontWeight.SemiBold,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-        )
-        Text(
-            text = args.session.jid,
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-        )
+        WorkspaceBadge(name = args.currentWaddle?.name)
+        Column(Modifier.weight(1f)) {
+            Text(
+                text = args.currentWaddle?.name ?: "Waddle",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
+                color = colors.sidebarContent,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                text = args.session.displayName,
+                style = MaterialTheme.typography.bodySmall,
+                color = colors.sidebarMuted,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
     }
 }
 
@@ -651,6 +1215,7 @@ private fun SidebarSectionHeader(
     action: String,
     onAction: () -> Unit,
 ) {
+    val colors = LocalWaddleColors.current
     Row(
         modifier =
             Modifier
@@ -663,10 +1228,13 @@ private fun SidebarSectionHeader(
             modifier = Modifier.weight(1f),
             style = MaterialTheme.typography.labelLarge,
             fontWeight = FontWeight.SemiBold,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            color = colors.sidebarMuted,
         )
-        TextButton(onClick = onAction, contentPadding = PaddingValues(horizontal = 8.dp)) {
-            Text(action)
+        TextButton(
+            onClick = onAction,
+            contentPadding = PaddingValues(horizontal = 8.dp),
+        ) {
+            Text(action, color = colors.sidebarContent)
         }
     }
 }
@@ -678,20 +1246,21 @@ private fun SidebarItem(
     selected: Boolean,
     onClick: () -> Unit,
 ) {
-    val rowColor = if (selected) MaterialTheme.colorScheme.primaryContainer else Color.Transparent
-    val contentColor = if (selected) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurface
+    val colors = LocalWaddleColors.current
+    val rowColor = if (selected) colors.sidebarSelected else Color.Transparent
+    val contentColor = if (selected) colors.sidebarSelectedContent else colors.sidebarContent
     Surface(
         color = rowColor,
         contentColor = contentColor,
-        shape = RoundedCornerShape(8.dp),
+        shape = RoundedCornerShape(6.dp),
         modifier =
             Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 8.dp)
+                .padding(horizontal = 6.dp)
                 .clickable(onClick = onClick),
     ) {
         Column(
-            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
             verticalArrangement = Arrangement.spacedBy(2.dp),
         ) {
             Text(
@@ -705,7 +1274,7 @@ private fun SidebarItem(
                 Text(
                     text = it,
                     style = MaterialTheme.typography.bodySmall,
-                    color = if (selected) contentColor else MaterialTheme.colorScheme.onSurfaceVariant,
+                    color = if (selected) contentColor else colors.sidebarMuted,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
@@ -716,18 +1285,19 @@ private fun SidebarItem(
 
 @Composable
 private fun SidebarEmpty(text: String) {
+    val colors = LocalWaddleColors.current
     Text(
         text = text,
         modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp),
         style = MaterialTheme.typography.bodySmall,
-        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        color = colors.sidebarMuted,
     )
 }
 
 @Composable
 private fun SidebarFooter(args: ChatLayoutArgs) {
     Column(
-        modifier = Modifier.padding(horizontal = 8.dp, vertical = 12.dp),
+        modifier = Modifier.padding(horizontal = 6.dp, vertical = 12.dp),
         verticalArrangement = Arrangement.spacedBy(4.dp),
     ) {
         SidebarItem(
@@ -742,51 +1312,6 @@ private fun SidebarFooter(args: ChatLayoutArgs) {
             selected = false,
             onClick = args.onOpenMembers,
         )
-    }
-}
-
-@Composable
-private fun WaddleChips(
-    waddles: List<WaddleEntity>,
-    selectedWaddleId: String?,
-    onSelectWaddle: (String) -> Unit,
-) {
-    LazyRow(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-        contentPadding = PaddingValues(12.dp),
-    ) {
-        items(waddles, key = WaddleEntity::id) { waddle ->
-            AssistChip(
-                onClick = { onSelectWaddle(waddle.id) },
-                label = { Text(waddle.name, maxLines = 1, overflow = TextOverflow.Ellipsis) },
-                leadingIcon = { SelectedDot(selected = selectedWaddleId == waddle.id) },
-            )
-        }
-    }
-}
-
-@Composable
-private fun ChannelChips(
-    channels: List<ChannelEntity>,
-    selectedWaddleId: String?,
-    selectedChannelId: String?,
-    onSelectChannel: (String, String) -> Unit,
-) {
-    LazyRow(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-        contentPadding = PaddingValues(12.dp),
-    ) {
-        items(channels, key = ChannelEntity::id) { channel ->
-            AssistChip(
-                onClick = {
-                    selectedWaddleId?.let { waddleId -> onSelectChannel(waddleId, channel.id) }
-                },
-                label = { Text("#${channel.name}", maxLines = 1, overflow = TextOverflow.Ellipsis) },
-                leadingIcon = { SelectedDot(selected = selectedChannelId == channel.id) },
-            )
-        }
     }
 }
 
@@ -1417,16 +1942,6 @@ private fun EmptyState(text: String) {
     ) {
         Text(text, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
-}
-
-@Composable
-private fun SelectedDot(selected: Boolean) {
-    Surface(
-        color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant,
-        shape = RoundedCornerShape(8.dp),
-        modifier = Modifier.size(10.dp),
-        content = {},
-    )
 }
 
 private val MessageEntity.messageKey: String

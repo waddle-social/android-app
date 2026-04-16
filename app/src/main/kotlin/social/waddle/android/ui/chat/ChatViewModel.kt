@@ -60,6 +60,7 @@ data class ChatUiState(
 
 @OptIn(ExperimentalCoroutinesApi::class)
 @HiltViewModel
+@Suppress("LargeClass")
 class ChatViewModel
     @Inject
     constructor(
@@ -182,6 +183,17 @@ class ChatViewModel
                 runCatching {
                     repository.refreshChannels(session.stored, waddleId)
                 }.onFailure(::showError)
+            }
+        }
+
+        fun clearSelectedChannel() {
+            mutableState.update {
+                it.copy(
+                    selectedChannelId = null,
+                    searchVisible = false,
+                    searchQuery = "",
+                    error = null,
+                )
             }
         }
 
