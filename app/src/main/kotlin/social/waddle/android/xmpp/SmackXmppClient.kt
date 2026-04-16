@@ -2,13 +2,20 @@ package social.waddle.android.xmpp
 
 import android.content.Context
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -69,11 +76,18 @@ class SmackXmppClient
         private val mutableIncomingDirectMessages = MutableSharedFlow<XmppDirectMessage>(extraBufferCapacity = INCOMING_BUFFER_SIZE)
         private val roomJoinMutex = Mutex()
         private val joinedRoomJids = Collections.synchronizedSet(mutableSetOf<String>())
+        private val reconnectScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         private var connection: AbstractXMPPConnection? = null
         private var mucNickname: Resourcepart? = null
         private var accountUserId: String? = null
         private var accountUsername: String? = null
         private var accountBareJid: String? = null
+        private var reconnectionAttempt = 0
+        private var lastDisconnectCause: String? = null
+
+        @Volatile private var intentionalDisconnect = false
+
+        @Volatile private var reconnectJob: Job? = null
 
         override val connectionState: StateFlow<XmppConnectionState> = mutableConnectionState.asStateFlow()
         override val incomingMessages: Flow<XmppHistoryMessage> = mutableIncomingMessages.asSharedFlow()
@@ -85,6 +99,9 @@ class SmackXmppClient
             environment: WaddleEnvironment,
         ) {
             withContext(Dispatchers.IO) {
+                intentionalDisconnect = false
+                reconnectionAttempt = 0
+                lastDisconnectCause = null
                 mutableConnectionState.value = XmppConnectionState.Connecting
                 runCatching {
                     AndroidSmackInitializer.initialize(context)
@@ -113,6 +130,9 @@ class SmackXmppClient
 
         override suspend fun disconnect() {
             withContext(Dispatchers.IO) {
+                intentionalDisconnect = true
+                reconnectJob?.cancel()
+                reconnectJob = null
                 connection?.let { activeConnection ->
                     ReconnectionManager.getInstanceFor(activeConnection).disableAutomaticReconnection()
                     activeConnection.disconnect()
@@ -123,6 +143,8 @@ class SmackXmppClient
                 accountUsername = null
                 accountBareJid = null
                 joinedRoomJids.clear()
+                reconnectionAttempt = 0
+                lastDisconnectCause = null
                 mutableConnectionState.value = XmppConnectionState.Disconnected
             }
         }
@@ -614,33 +636,101 @@ class SmackXmppClient
         private fun configureConnection(activeConnection: AbstractXMPPConnection) {
             registerIncomingMessageListener(activeConnection)
             registerIncomingDirectMessageListener(activeConnection)
-            ReconnectionManager
-                .getInstanceFor(activeConnection)
-                .apply {
-                    setFixedDelay(RECONNECT_DELAY_SECONDS)
-                    enableAutomaticReconnection()
-                }
+            ReconnectionManager.getInstanceFor(activeConnection).disableAutomaticReconnection()
             activeConnection.addConnectionListener(
                 object : ConnectionListener {
                     override fun authenticated(
                         connection: XMPPConnection,
                         resumed: Boolean,
                     ) {
+                        reconnectionAttempt = 0
+                        lastDisconnectCause = null
                         mutableConnectionState.value = XmppConnectionState.Connected(connection.user.toString())
                         rejoinRooms(activeConnection)
                     }
 
                     override fun connectionClosedOnError(exception: Exception) {
                         WaddleLog.error("XMPP connection closed on error.", exception)
-                        mutableConnectionState.value =
-                            XmppConnectionState.Failed(exception.message ?: exception::class.java.simpleName)
+                        lastDisconnectCause = exception.message ?: exception::class.java.simpleName
+                        if (!intentionalDisconnect) {
+                            scheduleReconnect(activeConnection)
+                        }
                     }
 
                     override fun connectionClosed() {
+                        if (!intentionalDisconnect) {
+                            WaddleLog.info("XMPP connection closed unexpectedly.")
+                            scheduleReconnect(activeConnection)
+                            return
+                        }
                         mutableConnectionState.value = XmppConnectionState.Disconnected
                     }
                 },
             )
+        }
+
+        private fun scheduleReconnect(activeConnection: AbstractXMPPConnection) {
+            reconnectJob?.cancel()
+            reconnectJob =
+                reconnectScope.launch {
+                    while (isActive && !intentionalDisconnect) {
+                        reconnectionAttempt += 1
+                        if (reconnectionAttempt > MAX_RECONNECT_ATTEMPTS) {
+                            WaddleLog.info(
+                                "Giving up XMPP reconnect after $MAX_RECONNECT_ATTEMPTS attempts.",
+                            )
+                            mutableConnectionState.value =
+                                XmppConnectionState.Failed(
+                                    "Reconnect gave up after $MAX_RECONNECT_ATTEMPTS attempts.",
+                                )
+                            return@launch
+                        }
+                        val delaySeconds = nextBackoffDelaySeconds(reconnectionAttempt)
+                        WaddleLog.info(
+                            "XMPP reconnect attempt $reconnectionAttempt scheduled in ${delaySeconds}s.",
+                        )
+                        mutableConnectionState.value =
+                            XmppConnectionState.Reconnecting(
+                                attempt = reconnectionAttempt,
+                                nextDelaySeconds = delaySeconds,
+                                cause = lastDisconnectCause,
+                            )
+                        delay(delaySeconds * MILLIS_PER_SECOND)
+                        if (intentionalDisconnect) {
+                            return@launch
+                        }
+                        mutableConnectionState.value = XmppConnectionState.Connecting
+                        val success =
+                            runCatching {
+                                if (activeConnection.isConnected) {
+                                    activeConnection.disconnect()
+                                }
+                                activeConnection.connect()
+                                activeConnection.login()
+                            }.onFailure { throwable ->
+                                WaddleLog.error(
+                                    "XMPP reconnect attempt $reconnectionAttempt failed.",
+                                    throwable,
+                                )
+                                lastDisconnectCause = throwable.message ?: throwable::class.java.simpleName
+                            }.isSuccess
+                        if (success) {
+                            return@launch
+                        }
+                    }
+                }
+        }
+
+        private fun nextBackoffDelaySeconds(attempt: Int): Int {
+            val exponent = (attempt - 1).coerceIn(0, MAX_BACKOFF_EXPONENT)
+            val base = RECONNECT_BASE_DELAY_SECONDS.toLong() shl exponent
+            val capped = base.coerceAtMost(MAX_RECONNECT_DELAY_SECONDS.toLong())
+            val jitterRange = (capped * RECONNECT_JITTER_RATIO).toLong().coerceAtLeast(1L)
+            val jitter = kotlin.random.Random.nextLong(-jitterRange, jitterRange + 1)
+            return (capped + jitter)
+                .coerceAtLeast(RECONNECT_BASE_DELAY_SECONDS.toLong())
+                .coerceAtMost(MAX_RECONNECT_DELAY_SECONDS.toLong())
+                .toInt()
         }
 
         private fun registerIncomingMessageListener(activeConnection: AbstractXMPPConnection) {
@@ -916,7 +1006,12 @@ class SmackXmppClient
             const val MAM_SEARCH_PAGE_SIZE = 50
             const val MAM_QUERY_TIMEOUT_MILLIS = 15_000L
             const val NICKNAME_SUFFIX_LENGTH = 8
-            const val RECONNECT_DELAY_SECONDS = 5
+            const val RECONNECT_BASE_DELAY_SECONDS = 2
+            const val MAX_RECONNECT_DELAY_SECONDS = 300
+            const val MAX_RECONNECT_ATTEMPTS = 12
+            const val MAX_BACKOFF_EXPONENT = 16
+            const val MILLIS_PER_SECOND = 1_000L
+            const val RECONNECT_JITTER_RATIO = 0.2
             val MENTION_PATTERN = Regex("(?:^|\\s)@(\\S+)")
             val EVERYONE_PATTERN = Regex("(?:^|\\s)@everyone(?:\\s|$)", RegexOption.IGNORE_CASE)
             val HERE_PATTERN = Regex("(?:^|\\s)@here(?:\\s|$)", RegexOption.IGNORE_CASE)

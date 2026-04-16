@@ -17,6 +17,12 @@ sealed interface XmppConnectionState {
         val jid: String,
     ) : XmppConnectionState
 
+    data class Reconnecting(
+        val attempt: Int,
+        val nextDelaySeconds: Int,
+        val cause: String?,
+    ) : XmppConnectionState
+
     data class Failed(
         val message: String,
     ) : XmppConnectionState
