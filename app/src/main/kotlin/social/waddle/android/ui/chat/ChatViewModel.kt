@@ -82,31 +82,6 @@ class ChatViewModel
         private val mutableState = MutableStateFlow(ChatUiState())
         val state: StateFlow<ChatUiState> = mutableState.asStateFlow()
 
-        init {
-            viewModelScope.launch {
-                combine(mutableState, channels) { uiState, channelList ->
-                    when {
-                        uiState.mode == ChatMode.DirectMessages && uiState.selectedDmPeerJid != null -> {
-                            ActiveConversation.Direct(uiState.selectedDmPeerJid)
-                        }
-
-                        uiState.mode == ChatMode.Rooms && uiState.selectedChannelId != null -> {
-                            val roomJid =
-                                channelList
-                                    .firstOrNull { it.id == uiState.selectedChannelId }
-                                    ?.roomJid
-                            roomJid?.let(ActiveConversation::Room)
-                        }
-
-                        else -> {
-                            null
-                        }
-                    }
-                }.distinctUntilChanged()
-                    .collect { active -> activeConversationTracker.setActive(active) }
-            }
-        }
-
         val waddles: StateFlow<List<WaddleEntity>> =
             repository
                 .observeWaddles()
@@ -238,6 +213,36 @@ class ChatViewModel
 
         private var connectedSessionId: String? = null
         private var currentSession: AuthSession? = null
+
+        // Declared at the bottom so every StateFlow this block captures
+        // (in particular [channels]) has been initialized by the time the
+        // coroutine body runs. viewModelScope uses Dispatchers.Main.immediate,
+        // which would otherwise start the body synchronously during <init>
+        // and NPE on the not-yet-assigned property.
+        init {
+            viewModelScope.launch {
+                combine(mutableState, channels) { uiState, channelList ->
+                    when {
+                        uiState.mode == ChatMode.DirectMessages && uiState.selectedDmPeerJid != null -> {
+                            ActiveConversation.Direct(uiState.selectedDmPeerJid)
+                        }
+
+                        uiState.mode == ChatMode.Rooms && uiState.selectedChannelId != null -> {
+                            val roomJid =
+                                channelList
+                                    .firstOrNull { it.id == uiState.selectedChannelId }
+                                    ?.roomJid
+                            roomJid?.let(ActiveConversation::Room)
+                        }
+
+                        else -> {
+                            null
+                        }
+                    }
+                }.distinctUntilChanged()
+                    .collect { active -> activeConversationTracker.setActive(active) }
+            }
+        }
 
         fun showRooms() {
             mutableState.update { it.copy(mode = ChatMode.Rooms, error = null) }
