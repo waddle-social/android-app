@@ -32,8 +32,16 @@ android {
         applicationId = "social.waddle.android"
         minSdk = 26
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1.0"
+        val baseVersionName = "0.1.0"
+        val runNumber = providers.environmentVariable("VERSION_CODE").orNull?.toIntOrNull() ?: 1
+        val versionSuffix = providers.environmentVariable("VERSION_SUFFIX").orNull
+        versionCode = runNumber
+        versionName =
+            if (versionSuffix.isNullOrBlank()) {
+                baseVersionName
+            } else {
+                "$baseVersionName+$versionSuffix"
+            }
         testInstrumentationRunner = "social.waddle.android.WaddleTestRunner"
 
         manifestPlaceholders["appAuthRedirectScheme"] = "social.waddle.android"
