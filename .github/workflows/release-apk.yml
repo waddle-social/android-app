@@ -63,11 +63,7 @@ jobs:
             echo "::add-mask::$RELEASE_KEYSTORE_PASSWORD"
             echo "::add-mask::$RELEASE_KEY_PASSWORD"
           else
-            echo "::warning title=Throwaway release signing key::\
-RELEASE_KEYSTORE_BASE64 (and friends) not configured — the APK will be signed \
-with a fresh throwaway key every build. Installs on top of a previous APK will \
-fail with INSTALL_FAILED_UPDATE_INCOMPATIBLE. Set the secrets to use a stable \
-signing key."
+            echo "::warning title=Throwaway release signing key::RELEASE_KEYSTORE_BASE64 (and friends) not configured — the APK will be signed with a fresh throwaway key every build. Installs on top of a previous APK will fail with INSTALL_FAILED_UPDATE_INCOMPATIBLE. Set the secrets to use a stable signing key."
             if [ ! -s "$KEYSTORE_PATH" ]; then
               keytool -genkeypair \
                 -keystore "$KEYSTORE_PATH" \
