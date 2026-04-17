@@ -90,6 +90,7 @@ class SmackXmppClient
         private val mutableConnectionState = MutableStateFlow<XmppConnectionState>(XmppConnectionState.Disconnected)
         private val mutableIncomingMessages = MutableSharedFlow<XmppHistoryMessage>(extraBufferCapacity = INCOMING_BUFFER_SIZE)
         private val mutableIncomingDirectMessages = MutableSharedFlow<XmppDirectMessage>(extraBufferCapacity = INCOMING_BUFFER_SIZE)
+        private val mutableCallSignals = MutableSharedFlow<InboundCallSignal>(extraBufferCapacity = INCOMING_BUFFER_SIZE)
         private val mutablePresences = MutableStateFlow<Map<String, Boolean>>(emptyMap())
 
         // Serialises connect()/disconnect() so the three callers that
@@ -120,6 +121,7 @@ class SmackXmppClient
         override val connectionState: StateFlow<XmppConnectionState> = mutableConnectionState.asStateFlow()
         override val incomingMessages: Flow<XmppHistoryMessage> = mutableIncomingMessages.asSharedFlow()
         override val incomingDirectMessages: Flow<XmppDirectMessage> = mutableIncomingDirectMessages.asSharedFlow()
+        override val callSignals: Flow<InboundCallSignal> = mutableCallSignals.asSharedFlow()
         override val supportedFeatures: List<XepFeature> = XmppFeatureRegistry.supported
         override val presences: StateFlow<Map<String, Boolean>> = mutablePresences.asStateFlow()
 
@@ -153,6 +155,7 @@ class SmackXmppClient
             runCatching {
                 AndroidSmackInitializer.initialize(context)
                 registerMamProviders()
+                registerCallProviders()
                 registerOAuthBearer()
                 val nextNickname = nicknameFor(session)
                 buildConnection(session, environment).also { next ->
@@ -742,6 +745,365 @@ class SmackXmppClient
                 )
             }
 
+        // ----- XEP-0215 External Service Discovery -----
+
+        override suspend fun discoverExternalServices(): List<ExternalService> =
+            withConnection { activeConnection ->
+                val bareJid = accountBareJid ?: return@withConnection emptyList<ExternalService>()
+                val domain = bareJid.substringAfter('@')
+                val request =
+                    social.waddle.android.xmpp.call.ExtDiscoRequestIQ().apply {
+                        to = JidCreate.domainBareFrom(domain)
+                    }
+                val response: IQ? =
+                    try {
+                        activeConnection.sendIqRequestAndWaitForResponse<social.waddle.android.xmpp.call.ExtDiscoResultIQ>(request)
+                    } catch (cause: Exception) {
+                        WaddleLog.info("XEP-0215 ExtDisco unavailable: ${cause.message}")
+                        null
+                    }
+                (response as? social.waddle.android.xmpp.call.ExtDiscoResultIQ)?.services.orEmpty()
+            }
+
+        // ----- XEP-0482 Call Invite messages -----
+
+        override suspend fun sendCallInvite(
+            peerJid: String,
+            sid: String,
+            sfuJid: String,
+            muji: Boolean,
+            video: Boolean,
+        ) {
+            sendCallInviteMessage(
+                peerJid = peerJid,
+                sid = sid,
+                sfuJid = sfuJid,
+                muji = muji,
+                video = video,
+            )
+        }
+
+        override suspend fun sendCallReject(
+            peerJid: String,
+            sid: String,
+        ) {
+            sendCallLifecycleMessage(peerJid = peerJid, sid = sid, tag = "reject")
+        }
+
+        override suspend fun sendCallLeft(
+            peerJid: String,
+            sid: String,
+        ) {
+            sendCallLifecycleMessage(peerJid = peerJid, sid = sid, tag = "left")
+        }
+
+        // ----- Generic Jingle IQ -----
+
+        override suspend fun sendJingleIq(
+            to: String,
+            jingleXml: String,
+        ) {
+            withConnection { activeConnection ->
+                val parsed = parseJingleOuter(jingleXml)
+                val iq =
+                    social.waddle.android.xmpp.call
+                        .JingleIQ(
+                            attributes = parsed.first,
+                            innerXml = parsed.second,
+                        ).apply {
+                            this.to = JidCreate.from(to)
+                            type = IQ.Type.set
+                        }
+                activeConnection.sendIqRequestAndWaitForResponse<IQ>(iq)
+                Unit
+            }
+        }
+
+        /**
+         * Strip the outer `<jingle ...>`...`</jingle>` wrapper and return
+         * (attributes, innerXml). The signaler already serialized a
+         * well-formed element, so we do minimal parsing here.
+         */
+        private fun parseJingleOuter(xml: String): Pair<Map<String, String>, String> {
+            val trimmed = xml.trim()
+            val openEnd = trimmed.indexOf('>')
+            check(openEnd > 0) { "Invalid Jingle XML: $xml" }
+            val openTag = trimmed.substring(0, openEnd + 1)
+            val selfClosing = openTag.endsWith("/>")
+            val inner =
+                if (selfClosing) {
+                    ""
+                } else {
+                    val closeStart = trimmed.lastIndexOf("</")
+                    check(closeStart > openEnd) { "Invalid Jingle XML: missing close tag" }
+                    trimmed.substring(openEnd + 1, closeStart)
+                }
+            val attrs = parseAttrs(openTag)
+            return attrs to inner
+        }
+
+        /**
+         * `openTag` looks like `<jingle xmlns='...' action='...' sid='...'>`
+         * or `<jingle ... />`. A regex matches `name='value'` / `name="value"`
+         * pairs robustly enough for our well-formed inputs. The `xmlns`
+         * declaration is dropped — callers supply namespace separately.
+         */
+        private fun parseAttrs(openTag: String): Map<String, String> {
+            val afterName = openTag.substringAfter(' ', "").trimEnd('>', '/')
+            return ATTR_REGEX
+                .findAll(afterName)
+                .map { match -> match.groupValues[1] to match.groupValues[2] }
+                .filter { (name, _) -> name != "xmlns" }
+                .associate { it }
+                .toMap(LinkedHashMap())
+        }
+
+        /**
+         * Build and send a Waddle XEP-0482 call invite. Matches the format
+         * the `chat/` web client emits byte-for-byte:
+         *
+         * ```xml
+         * <invite xmlns='urn:xmpp:call-invites:0' id='<sid>'>
+         *   <muji/>                                 <!-- muji=true only -->
+         *   <jingle sid='<sid>' jid='<sfuJid>'/>
+         *   <external uri='xmpp:<sfuJid>?jingle;sid=<sid>'/>
+         * </invite>
+         * <meeting xmlns='urn:xmpp:http:online-meetings:invite:0'
+         *          desc='Video call'|'Audio call'
+         *          type='muji'|'dm'
+         *          url='xmpp:<sfuJid>?jingle;sid=<sid>'/>
+         * ```
+         */
+        private suspend fun sendCallInviteMessage(
+            peerJid: String,
+            sid: String,
+            sfuJid: String,
+            muji: Boolean,
+            video: Boolean,
+        ) {
+            withConnection { activeConnection ->
+                val externalUri = "xmpp:$sfuJid?jingle;sid=$sid"
+                val invitesNs = social.waddle.android.xmpp.call.CallNamespaces.CALL_INVITES
+                val meetingNs = social.waddle.android.xmpp.call.CallNamespaces.MEETING
+                val desc = if (video) "Video call" else "Audio call"
+
+                val inviteBuilder =
+                    org.jivesoftware.smack.packet.StandardExtensionElement
+                        .builder("invite", invitesNs)
+                        .addAttribute("id", sid)
+                if (muji) {
+                    inviteBuilder.addElement(
+                        org.jivesoftware.smack.packet.StandardExtensionElement
+                            .builder("muji", invitesNs)
+                            .build(),
+                    )
+                }
+                inviteBuilder.addElement(
+                    org.jivesoftware.smack.packet.StandardExtensionElement
+                        .builder("jingle", invitesNs)
+                        .addAttribute("sid", sid)
+                        .addAttribute("jid", sfuJid)
+                        .build(),
+                )
+                inviteBuilder.addElement(
+                    org.jivesoftware.smack.packet.StandardExtensionElement
+                        .builder("external", invitesNs)
+                        .addAttribute("uri", externalUri)
+                        .build(),
+                )
+
+                val meeting =
+                    org.jivesoftware.smack.packet.StandardExtensionElement
+                        .builder("meeting", meetingNs)
+                        .addAttribute("type", if (muji) "muji" else "dm")
+                        .addAttribute("url", externalUri)
+                        .addAttribute("desc", desc)
+                        .build()
+
+                val messageType = if (muji) Message.Type.groupchat else Message.Type.chat
+                val addressee = if (muji) JidCreate.entityBareFrom(peerJid) else JidCreate.from(peerJid)
+                val builder =
+                    StanzaBuilder
+                        .buildMessage(nextStanzaId())
+                        .to(addressee)
+                        .ofType(messageType)
+                        .setBody("$desc started")
+                        .addExtension(inviteBuilder.build())
+                        .addExtension(meeting)
+                        .addExtension(XmppExtensions.storeHint())
+                activeConnection.sendStanza(builder.build())
+                WaddleLog.info("Sent XEP-0482 invite sid=$sid to $peerJid (muji=$muji video=$video).")
+            }
+        }
+
+        private suspend fun sendCallLifecycleMessage(
+            peerJid: String,
+            sid: String,
+            tag: String,
+        ) {
+            withConnection { activeConnection ->
+                val extension =
+                    org.jivesoftware.smack.packet.StandardExtensionElement
+                        .builder(tag, social.waddle.android.xmpp.call.CallNamespaces.CALL_INVITES)
+                        .addAttribute("id", sid)
+                        .build()
+                val builder =
+                    StanzaBuilder
+                        .buildMessage(nextStanzaId())
+                        .to(JidCreate.from(peerJid))
+                        .ofType(Message.Type.chat)
+                        .addExtension(extension)
+                        .addExtension(XmppExtensions.noStoreHint())
+                activeConnection.sendStanza(builder.build())
+                WaddleLog.info("Sent XEP-0482 <$tag> sid=$sid to $peerJid.")
+            }
+        }
+
+        private fun registerCallSignalListeners(activeConnection: AbstractXMPPConnection) {
+            // Own the IQ-set response flow for Jingle IQs. Without this,
+            // Smack's default processor replies with <service-unavailable/>
+            // before our async listener sees the stanza — the SFU then
+            // thinks our client can't speak Jingle and stops sending.
+            activeConnection.registerIQRequestHandler(
+                object : org.jivesoftware.smack.iqrequest.AbstractIqRequestHandler(
+                    social.waddle.android.xmpp.call.JingleIQ.ELEMENT,
+                    social.waddle.android.xmpp.call.CallNamespaces.JINGLE,
+                    IQ.Type.set,
+                    org.jivesoftware.smack.iqrequest.IQRequestHandler.Mode.async,
+                ) {
+                    override fun handleIQRequest(iqRequest: IQ): IQ {
+                        val jingle = iqRequest as social.waddle.android.xmpp.call.JingleIQ
+                        val fromJid = jingle.from?.toString().orEmpty()
+                        val jingleXml = buildIncomingJingleXml(jingle)
+                        if (!mutableCallSignals.tryEmit(
+                                InboundCallSignal.Jingle(fromJid = fromJid, jingleXml = jingleXml),
+                            )
+                        ) {
+                            WaddleLog.info("Dropped Jingle IQ from $fromJid — call-signal buffer full.")
+                        }
+                        return IQ.createResultIQ(jingle)
+                    }
+                },
+            )
+
+            activeConnection.addAsyncStanzaListener(
+                StanzaListener { stanza ->
+                    val message = stanza as? Message ?: return@StanzaListener
+                    val fromJid = message.from?.toString()?.takeIf { it.isNotBlank() } ?: return@StanzaListener
+                    val signal = parseCallInviteExtensions(message, fromJid) ?: return@StanzaListener
+                    if (!mutableCallSignals.tryEmit(signal)) {
+                        WaddleLog.info("Dropped XEP-0482 call signal from $fromJid — buffer full.")
+                    }
+                },
+                StanzaFilter { stanza ->
+                    stanza is Message &&
+                        (stanza.type == Message.Type.chat || stanza.type == Message.Type.groupchat)
+                },
+            )
+        }
+
+        private fun buildIncomingJingleXml(iq: social.waddle.android.xmpp.call.JingleIQ): String {
+            val sb = StringBuilder()
+            sb
+                .append("<jingle xmlns='")
+                .append(social.waddle.android.xmpp.call.CallNamespaces.JINGLE)
+                .append('\'')
+            for ((k, v) in iq.attributes) {
+                sb
+                    .append(' ')
+                    .append(k)
+                    .append("='")
+                    .append(v)
+                    .append('\'')
+            }
+            if (iq.innerXml.isEmpty()) {
+                sb.append("/>")
+            } else {
+                sb.append('>').append(iq.innerXml).append("</jingle>")
+            }
+            return sb.toString()
+        }
+
+        /**
+         * Parse Waddle's XEP-0482 invite / reject / left message extensions.
+         *
+         * The real wire format (confirmed from the `chat/` client and live
+         * captures) is:
+         *
+         * ```xml
+         * <invite xmlns='urn:xmpp:call-invites:0' id='<msgId>'>
+         *   <muji/>                                    <!-- only for group calls -->
+         *   <jingle sid='<sid>' jid='<sfuJid>'/>
+         *   <external uri='xmpp:...?jingle;sid=...'/>  <!-- optional -->
+         * </invite>
+         * <meeting xmlns='urn:xmpp:http:online-meetings:invite:0'
+         *          desc='Video call'|'Audio call'
+         *          type='muji'|'dm'
+         *          url='xmpp:...?jingle;sid=...'/>
+         * ```
+         *
+         * Key gotchas the earlier parser got wrong:
+         *  - `muji` is an empty child element, not a boolean attribute.
+         *  - The Jingle SID + SFU jid live on a child `<jingle>` element,
+         *    not on the invite's own attributes.
+         *  - Video/audio is signalled by `<meeting desc=>`, not a flag on
+         *    the invite itself.
+         */
+        private fun parseCallInviteExtensions(
+            message: Message,
+            fromJid: String,
+        ): InboundCallSignal? {
+            val invitesNs = social.waddle.android.xmpp.call.CallNamespaces.CALL_INVITES
+            val invite =
+                message.getExtensionElement("invite", invitesNs) as?
+                    org.jivesoftware.smack.packet.StandardExtensionElement
+            if (invite != null) return parseInviteElement(invite, message, fromJid)
+            val reject =
+                message.getExtensionElement("reject", invitesNs) as?
+                    org.jivesoftware.smack.packet.StandardExtensionElement
+            if (reject != null) {
+                val sid = reject.getAttributeValue("id") ?: return null
+                return InboundCallSignal.Reject(fromJid = fromJid, sid = sid)
+            }
+            val left =
+                message.getExtensionElement("left", invitesNs) as?
+                    org.jivesoftware.smack.packet.StandardExtensionElement
+            if (left != null) {
+                val sid = left.getAttributeValue("id") ?: return null
+                return InboundCallSignal.Left(fromJid = fromJid, sid = sid)
+            }
+            return null
+        }
+
+        private fun parseInviteElement(
+            invite: org.jivesoftware.smack.packet.StandardExtensionElement,
+            message: Message,
+            fromJid: String,
+        ): InboundCallSignal.Invite? {
+            val inviteId = invite.getAttributeValue("id") ?: return null
+            val jingleChild = invite.getFirstElement("jingle")
+            val sid = jingleChild?.getAttributeValue("sid") ?: inviteId
+            val jingleJid = jingleChild?.getAttributeValue("jid")
+            val muji = invite.getFirstElement("muji") != null
+
+            val meeting =
+                message.getExtensionElement(
+                    "meeting",
+                    social.waddle.android.xmpp.call.CallNamespaces.MEETING,
+                ) as? org.jivesoftware.smack.packet.StandardExtensionElement
+            val meetingDesc = meeting?.getAttributeValue("desc")
+            val video = meetingDesc?.contains("video", ignoreCase = true) ?: true
+
+            return InboundCallSignal.Invite(
+                fromJid = fromJid,
+                sid = sid,
+                muji = muji,
+                jingleJid = jingleJid,
+                video = video,
+                meetingDescription = meetingDesc,
+            )
+        }
+
         private suspend fun sendMarker(
             roomJid: String,
             extension: org.jivesoftware.smack.packet.XmlElement,
@@ -800,6 +1162,7 @@ class SmackXmppClient
             registerIncomingMessageListener(activeConnection)
             registerIncomingDirectMessageListener(activeConnection)
             registerPresenceListener(activeConnection)
+            registerCallSignalListeners(activeConnection)
             ReconnectionManager.getInstanceFor(activeConnection).disableAutomaticReconnection()
             activeConnection.addConnectionListener(
                 object : ConnectionListener {
@@ -1195,6 +1558,21 @@ class SmackXmppClient
             }
         }
 
+        private fun registerCallProviders() {
+            ProviderManager.addIQProvider(
+                social.waddle.android.xmpp.call.JingleIQ.ELEMENT,
+                social.waddle.android.xmpp.call.CallNamespaces.JINGLE,
+                social.waddle.android.xmpp.call
+                    .JingleIQProvider(),
+            )
+            ProviderManager.addIQProvider(
+                "services",
+                social.waddle.android.xmpp.call.CallNamespaces.EXT_DISCO,
+                social.waddle.android.xmpp.call
+                    .ExtDiscoIQProvider(),
+            )
+        }
+
         private fun ChatFileAttachment.toFileSharingExtension(): org.jivesoftware.smack.packet.XmlElement =
             XmppExtensions.fileSharing(
                 url = url,
@@ -1283,6 +1661,10 @@ class SmackXmppClient
         private fun nextStanzaId(): String = StringUtils.secureUniqueRandomString()
 
         private companion object {
+            // Matches `name='value'` or `name="value"` attribute pairs from
+            // our own serialized Jingle output — values never contain the
+            // surrounding quote character on the generating side.
+            val ATTR_REGEX: Regex = Regex("""([\w:-]+)=['"]([^'"]*)['"]""")
             const val DEFAULT_MUC_NICKNAME = "waddle"
             const val ANDROID_MUC_NICKNAME_SEGMENT = "android"
             const val MAM_FIN_ELEMENT = "fin"

@@ -4,8 +4,8 @@ agp = "9.1.1"
 androidxTest = "1.7.0"
 appcompat = "1.7.1"
 appauth = "0.11.1"
-biometric = "1.2.0-alpha05"
-coil = "2.7.0"
+biometric = "1.1.0"
+coil = "3.4.0"
 composeBom = "2026.03.01"
 coroutines = "1.10.2"
 datastore = "1.2.1"
@@ -27,6 +27,7 @@ smack = "4.5.0-rc1"
 turbine = "1.2.1"
 work = "2.11.2"
 hiltWork = "1.3.0"
+streamWebrtc = "1.3.10"
 
 [libraries]
 androidx-activity-compose = { module = "androidx.activity:activity-compose", version.ref = "activity" }
@@ -58,11 +59,14 @@ androidx-test-ext-junit = { module = "androidx.test.ext:junit-ktx", version = "1
 androidx-test-runner = { module = "androidx.test:runner", version = "1.7.0" }
 appauth = { module = "net.openid:appauth", version.ref = "appauth" }
 androidx-biometric = { module = "androidx.biometric:biometric", version.ref = "biometric" }
-coil-compose = { module = "io.coil-kt:coil-compose", version.ref = "coil" }
+coil-compose = { module = "io.coil-kt.coil3:coil-compose", version.ref = "coil" }
+coil-network-ktor3 = { module = "io.coil-kt.coil3:coil-network-ktor3", version.ref = "coil" }
 hilt-android = { module = "com.google.dagger:hilt-android", version.ref = "hilt" }
 hilt-compiler = { module = "com.google.dagger:hilt-compiler", version.ref = "hilt" }
 jsoup = { module = "org.jsoup:jsoup", version.ref = "jsoup" }
 junit = { module = "junit:junit", version.ref = "junit" }
+stream-webrtc-android = { module = "io.getstream:stream-webrtc-android", version.ref = "streamWebrtc" }
+stream-webrtc-android-ui = { module = "io.getstream:stream-webrtc-android-ui", version.ref = "streamWebrtc" }
 kotlinx-coroutines-android = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-android", version.ref = "coroutines" }
 kotlinx-coroutines-test = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-test", version.ref = "coroutines" }
 kotlinx-serialization-json = { module = "org.jetbrains.kotlinx:kotlinx-serialization-json", version.ref = "kotlinxSerializationJson" }

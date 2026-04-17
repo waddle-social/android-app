@@ -187,18 +187,22 @@ fun ChatScreen(
         onRefresh = { viewModel.refresh(session) },
         snackbarHost = snackbarHost,
     ) { padding ->
-        ChatScreenContent(
-            session = session,
-            viewModel = viewModel,
-            state = state,
-            lists = lists,
-            compact = compact,
-            activeDialog = activeDialog,
-            onActiveDialogChange = { activeDialog = it },
-            onRoomAttachmentPicked = roomAttachmentHandler,
-            onDirectMessageAttachmentPicked = directAttachmentHandler,
-            padding = padding,
-        )
+        Column(modifier = Modifier.padding(top = padding.calculateTopPadding())) {
+            social.waddle.android.ui.call
+                .IncomingCallBanner(onAccepted = {})
+            ChatScreenContent(
+                session = session,
+                viewModel = viewModel,
+                state = state,
+                lists = lists,
+                compact = compact,
+                activeDialog = activeDialog,
+                onActiveDialogChange = { activeDialog = it },
+                onRoomAttachmentPicked = roomAttachmentHandler,
+                onDirectMessageAttachmentPicked = directAttachmentHandler,
+                padding = PaddingValues(bottom = padding.calculateBottomPadding()),
+            )
+        }
     }
 }
 
@@ -1873,21 +1877,7 @@ private fun MessageExtras(
             )
         }
     }
-    message.callInviteId?.let {
-        AssistChip(
-            onClick = {
-                message.callExternalUri?.let(uriHandler::openUri)
-            },
-            label = {
-                Text(
-                    text = message.callDescription ?: "Call started",
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            },
-            modifier = Modifier.padding(top = 6.dp),
-        )
-    }
+    message.callInviteId?.let { CallInviteChip(message) }
     if (message.isSticker) {
         Text(
             text = "Sticker",
@@ -1926,7 +1916,7 @@ private fun LinkPreviewCard(
     ) {
         Column(modifier = Modifier.padding(12.dp)) {
             preview.imageUrl?.let { image ->
-                coil.compose.AsyncImage(
+                coil3.compose.AsyncImage(
                     model = image,
                     contentDescription = preview.title ?: "Link preview image",
                     modifier =
@@ -1991,7 +1981,7 @@ private fun InlineImageAttachment(
         shape = RoundedCornerShape(12.dp),
         color = MaterialTheme.colorScheme.surfaceVariant,
     ) {
-        coil.compose.AsyncImage(
+        coil3.compose.AsyncImage(
             model = url,
             contentDescription = description ?: "Image attachment",
             modifier =
@@ -2592,3 +2582,91 @@ private val MESSAGE_STAMP_FORMATTER: DateTimeFormatter = DateTimeFormatter.ofPat
 private val XEP_0393_INLINE_PATTERN = Regex("(`[^`\\n]+`|\\*[^*\\n]+\\*|~[^~\\n]+~)")
 private val QUICK_REACTIONS = listOf("+1", "❤️", "😂", "🎉", "👀")
 private const val TYPING_NAME_LIMIT = 2
+
+/**
+ * Chip rendered beneath a room message that advertises a Muji call. Tapping
+ * it requests the mic permission (and camera for video calls), then joins
+ * the existing Jingle session via [social.waddle.android.call.CallController.joinExistingCall].
+ *
+ * Foreground-service rules on Android 14+ require the caller to hold the
+ * backing permission before `startForeground` — without this gate the
+ * service crashes with InvalidForegroundServiceTypeException.
+ */
+@Composable
+private fun CallInviteChip(message: MessageEntity) {
+    val callViewModel: social.waddle.android.ui.call.CallViewModel =
+        androidx.hilt.lifecycle.viewmodel.compose
+            .hiltViewModel()
+    val sid = parseJingleSid(message.callExternalUri)
+    val sfuJid = parseJingleSfuJid(message.callExternalUri)
+    val audioOnly = message.callDescription?.contains("audio", ignoreCase = true) == true
+
+    val permissionLauncher =
+        rememberLauncherForActivityResult(
+            ActivityResultContracts.RequestMultiplePermissions(),
+        ) { grants ->
+            val micGranted = grants[android.Manifest.permission.RECORD_AUDIO] == true
+            if (!micGranted) {
+                social.waddle.android.util.WaddleLog.info(
+                    "Call join aborted — RECORD_AUDIO denied.",
+                )
+                return@rememberLauncherForActivityResult
+            }
+            if (sid != null && sfuJid != null) {
+                callViewModel.joinExistingCall(
+                    roomJid = message.roomJid,
+                    sfuJid = sfuJid,
+                    sid = sid,
+                    audioOnly = audioOnly,
+                )
+            }
+        }
+
+    AssistChip(
+        onClick = {
+            if (sid == null || sfuJid == null || !message.callMuji) {
+                social.waddle.android.util.WaddleLog.info(
+                    "Call chip click ignored — no parseable sid/sfu or not a Muji call.",
+                )
+                return@AssistChip
+            }
+            val permissions =
+                if (audioOnly) {
+                    arrayOf(android.Manifest.permission.RECORD_AUDIO)
+                } else {
+                    arrayOf(
+                        android.Manifest.permission.RECORD_AUDIO,
+                        android.Manifest.permission.CAMERA,
+                    )
+                }
+            permissionLauncher.launch(permissions)
+        },
+        label = {
+            Text(
+                text = message.callDescription ?: "Call started",
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        },
+        modifier = Modifier.padding(top = 6.dp),
+    )
+}
+
+/**
+ * Extract the Jingle session ID from a Waddle call external URI of the form
+ * `xmpp:<sfuJid>?jingle;sid=<sid>`. Returns null for any other shape.
+ */
+private fun parseJingleSid(externalUri: String?): String? {
+    val uri = externalUri ?: return null
+    val marker = ";sid="
+    val idx = uri.indexOf(marker)
+    if (idx < 0) return null
+    return uri.substring(idx + marker.length).takeIf { it.isNotBlank() }
+}
+
+/** Extract the SFU JID from `xmpp:<sfuJid>?jingle;sid=...`. */
+private fun parseJingleSfuJid(externalUri: String?): String? {
+    val uri = externalUri ?: return null
+    val afterScheme = uri.removePrefix("xmpp:").takeIf { it != uri } ?: return null
+    return afterScheme.substringBefore('?').takeIf { it.isNotBlank() }
+}

@@ -23,6 +23,10 @@ import io.ktor.serialization.kotlinx.json.json
 import kotlinx.serialization.json.Json
 import net.openid.appauth.AuthorizationService
 import social.waddle.android.auth.AuthRepository
+import social.waddle.android.call.CallSignaler
+import social.waddle.android.call.JingleSdpBridge
+import social.waddle.android.call.RealJingleSdpBridge
+import social.waddle.android.call.XmppJingleCallSignaler
 import social.waddle.android.data.db.AccountDao
 import social.waddle.android.data.db.AppDatabase
 import social.waddle.android.data.db.ChannelDao
@@ -240,4 +244,16 @@ abstract class XmppModule {
     @Binds
     @Singleton
     abstract fun bindSessionProvider(authRepository: AuthRepository): SessionProvider
+}
+
+@Module
+@InstallIn(SingletonComponent::class)
+abstract class CallBindings {
+    @Binds
+    @Singleton
+    abstract fun bindCallSignaler(impl: XmppJingleCallSignaler): CallSignaler
+
+    @Binds
+    @Singleton
+    abstract fun bindJingleSdpBridge(impl: RealJingleSdpBridge): JingleSdpBridge
 }

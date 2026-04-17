@@ -7,10 +7,24 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-permission android:name="android.permission.VIBRATE" />
+
+    <uses-feature
+        android:name="android.hardware.camera"
+        android:required="false" />
+    <uses-feature
+        android:name="android.hardware.microphone"
+        android:required="false" />
 
     <application
         android:name=".WaddleApplication"
@@ -51,6 +65,20 @@
             android:name=".notifications.WaddleMessagingService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
+
+        <service
+            android:name=".call.WaddleCallService"
+            android:exported="false"
+            android:foregroundServiceType="microphone|camera" />
+
+        <receiver
+            android:name=".call.WaddleCallControlReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="social.waddle.android.CALL_ACCEPT" />
+                <action android:name="social.waddle.android.CALL_HANG_UP" />
+            </intent-filter>
+        </receiver>
 
         <receiver
             android:name=".notifications.WaddleBootReceiver"

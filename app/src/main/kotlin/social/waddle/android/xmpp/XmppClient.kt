@@ -117,6 +117,9 @@ interface XmppClient {
     val incomingDirectMessages: Flow<XmppDirectMessage>
     val supportedFeatures: List<XepFeature>
 
+    /** Stream of call-related stanzas (XEP-0482 invite/reject/left, XEP-0166 Jingle IQs). */
+    val callSignals: Flow<InboundCallSignal>
+
     /** Map of bare JID → true when we've observed an `available` presence for that peer. */
     val presences: StateFlow<Map<String, Boolean>>
 
@@ -237,6 +240,107 @@ interface XmppClient {
         contentType: String,
         sizeBytes: Long,
     ): UploadSlot?
+
+    // ----- Call signaling -----
+
+    /**
+     * XEP-0215 `<services xmlns="urn:xmpp:extdisco:2">` to the user's domain.
+     * Returns the parsed STUN/TURN service list. Empty list when the server
+     * doesn't support ExtDisco — WebRTC falls back to host candidates.
+     */
+    suspend fun discoverExternalServices(): List<ExternalService>
+
+    /**
+     * Send a XEP-0482 call invite `<message>` to [peerJid] announcing the
+     * Jingle [sid] and SFU [sfuJid]. If [muji] is true, the invite advertises
+     * a Muji group call.
+     */
+    suspend fun sendCallInvite(
+        peerJid: String,
+        sid: String,
+        sfuJid: String,
+        muji: Boolean,
+        video: Boolean,
+    )
+
+    /** Send a XEP-0482 `<reject>` message for [sid] to [peerJid]. */
+    suspend fun sendCallReject(
+        peerJid: String,
+        sid: String,
+    )
+
+    /** Send a XEP-0482 `<left>` message for [sid] to [peerJid]. */
+    suspend fun sendCallLeft(
+        peerJid: String,
+        sid: String,
+    )
+
+    /**
+     * Send a Jingle IQ (`session-initiate`, `session-accept`,
+     * `transport-info`, `session-terminate`, etc.) to [to]. The caller is
+     * responsible for populating the [jingleXml] element with namespace
+     * `urn:xmpp:jingle:1` and the appropriate action.
+     */
+    suspend fun sendJingleIq(
+        to: String,
+        jingleXml: String,
+    )
+}
+
+/**
+ * Parsed XEP-0215 entry from the `<services>` IQ. A hostname, a port, and
+ * (for TURN) credentials + transport.
+ */
+data class ExternalService(
+    val host: String,
+    val port: Int,
+    val type: String,
+    val transport: String? = null,
+    val username: String? = null,
+    val password: String? = null,
+    val restricted: Boolean = false,
+    val expires: String? = null,
+)
+
+/**
+ * An inbound call-signalling stanza we've parsed off the wire but haven't
+ * yet mapped to a [social.waddle.android.call.CallSignalEvent]. The signaler
+ * owns that mapping so it can stay focused on the wire ↔ domain seam.
+ */
+sealed interface InboundCallSignal {
+    /** XEP-0482 invite message arrived. */
+    data class Invite(
+        val fromJid: String,
+        val sid: String,
+        val muji: Boolean,
+        val jingleJid: String?,
+        val video: Boolean,
+        val meetingDescription: String?,
+    ) : InboundCallSignal
+
+    /** XEP-0482 reject message arrived. */
+    data class Reject(
+        val fromJid: String,
+        val sid: String,
+    ) : InboundCallSignal
+
+    /** XEP-0482 left message arrived. */
+    data class Left(
+        val fromJid: String,
+        val sid: String,
+    ) : InboundCallSignal
+
+    /**
+     * A Jingle IQ arrived. [jingleXml] is the serialized `<jingle>` element
+     * (namespace `urn:xmpp:jingle:1`); the signaler parses it using the
+     * bridge's JingleElement model. Responding with an IQ result is the
+     * XmppClient's responsibility — the caller only needs to react to the
+     * payload.
+     */
+    data class Jingle(
+        val fromJid: String,
+        val jingleXml: String,
+    ) : InboundCallSignal
 }
 
 enum class ChatState {

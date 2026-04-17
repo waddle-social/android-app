@@ -20,12 +20,16 @@ import androidx.navigation3.runtime.entryProvider
 import androidx.navigation3.ui.NavDisplay
 import kotlinx.coroutines.launch
 import social.waddle.android.auth.AuthViewModel
+import social.waddle.android.call.CallState
+import social.waddle.android.call.WaddleCallService
 import social.waddle.android.notifications.CatchUpScheduler
 import social.waddle.android.notifications.DeepLink
 import social.waddle.android.notifications.PendingDeepLink
 import social.waddle.android.notifications.WaddleMessagingService
 import social.waddle.android.ui.auth.AccountScreen
 import social.waddle.android.ui.auth.SignInScreen
+import social.waddle.android.ui.call.CallScreen
+import social.waddle.android.ui.call.CallViewModel
 import social.waddle.android.ui.chat.ChatScreen
 import social.waddle.android.ui.chat.ChatViewModel
 import social.waddle.android.ui.lock.AppLockViewModel
@@ -36,6 +40,7 @@ fun WaddleApp(
     authViewModel: AuthViewModel = hiltViewModel(),
     chatViewModel: ChatViewModel = hiltViewModel(),
     appLockViewModel: AppLockViewModel = hiltViewModel(),
+    callViewModel: CallViewModel = hiltViewModel(),
 ) {
     val lockEnabled by appLockViewModel.lockEnabled.collectAsStateWithLifecycle()
     val authState by authViewModel.state.collectAsStateWithLifecycle()
@@ -60,6 +65,7 @@ fun WaddleApp(
         chatViewModel = chatViewModel,
     )
     AuthErrorSnackbar(authState = authState, snackbarHost = snackbarHostState, authViewModel = authViewModel)
+    CallNavigationEffect(callViewModel = callViewModel, backStack = backStack, context = context)
 
     Surface(modifier = Modifier.fillMaxSize()) {
         NavDisplay(
@@ -83,6 +89,14 @@ fun WaddleApp(
                             viewModel = chatViewModel,
                             onOpenAccount = { backStack += Route.Account },
                             snackbarHost = { SnackbarHost(snackbarHostState) },
+                        )
+                    }
+                    entry<Route.Call> {
+                        CallScreen(
+                            onCallFinished = {
+                                if (backStack.lastOrNull() == Route.Call) backStack.removeLastOrNull()
+                            },
+                            viewModel = callViewModel,
                         )
                     }
                     entry<Route.Account> {
@@ -149,6 +163,49 @@ private fun DeepLinkRouter(
             }
         }
         pendingDeepLink.consume()
+    }
+}
+
+/**
+ * Routes the user into [Route.Call] when a call is in flight and pops back out
+ * when it ends. Keeps the signaler's event collector wired for as long as the
+ * composable is in the tree so incoming invites update [CallState] even while
+ * the call screen is not yet mounted.
+ */
+@Composable
+private fun CallNavigationEffect(
+    callViewModel: CallViewModel,
+    backStack: NavBackStack<Route>,
+    context: android.content.Context,
+) {
+    LaunchedEffect(Unit) { callViewModel.observeSignaler() }
+    val callState by callViewModel.state.collectAsStateWithLifecycle()
+    LaunchedEffect(callState) {
+        when (callState) {
+            is CallState.OutgoingRinging,
+            is CallState.Connecting,
+            is CallState.InCall,
+            -> {
+                WaddleCallService.start(context)
+                if (backStack.lastOrNull() != Route.Call) backStack += Route.Call
+            }
+
+            is CallState.Incoming -> {
+                // Start the service so it posts a full-screen-intent
+                // notification while the banner handles the in-app accept UX.
+                WaddleCallService.start(context)
+            }
+
+            is CallState.Ended -> {
+                WaddleCallService.stop(context)
+                if (backStack.lastOrNull() == Route.Call) backStack.removeLastOrNull()
+            }
+
+            CallState.Idle -> {
+                WaddleCallService.stop(context)
+                if (backStack.lastOrNull() == Route.Call) backStack.removeLastOrNull()
+            }
+        }
     }
 }
 
