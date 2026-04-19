@@ -12,10 +12,11 @@ concurrency:
 
 permissions:
   contents: read
+  packages: read
 
 jobs:
   verify:
-    name: Lint, static analysis, unit tests
+    name: Lint, static analysis, unit tests, e2e tests
     runs-on: ubuntu-latest
     env:
       CI: true
@@ -41,3 +42,13 @@ jobs:
 
       - name: Run verify
         run: ./gradlew --no-daemon verify
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run Waddle e2e tests
+        run: ./gradlew --no-daemon :app:waddleE2eTest
