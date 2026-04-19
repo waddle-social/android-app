@@ -16,9 +16,9 @@ sealed interface ActiveConversation {
 }
 
 /**
- * Bridges UI state and notifications: the UI publishes the conversation the
- * user is currently viewing so the notification poster can suppress alerts for
- * that room or peer (Slack-style foreground suppression).
+ * Bridges UI state and notifications: the UI publishes foreground state and
+ * the currently viewed conversation so the notification poster can suppress
+ * alerts while the user is already in the app.
  */
 @Singleton
 class ActiveConversationTracker
@@ -26,10 +26,18 @@ class ActiveConversationTracker
     constructor() {
         private val mutableActive = MutableStateFlow<ActiveConversation?>(null)
         val active = mutableActive.asStateFlow()
+        private val mutableAppForeground = MutableStateFlow(false)
+        val appForeground = mutableAppForeground.asStateFlow()
 
         fun setActive(conversation: ActiveConversation?) {
             mutableActive.value = conversation
         }
 
+        fun setAppForeground(foreground: Boolean) {
+            mutableAppForeground.value = foreground
+        }
+
         fun isActive(conversation: ActiveConversation): Boolean = mutableActive.value == conversation
+
+        fun isAppForeground(): Boolean = mutableAppForeground.value
     }

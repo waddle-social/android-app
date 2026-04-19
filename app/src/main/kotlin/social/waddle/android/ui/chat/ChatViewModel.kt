@@ -182,6 +182,10 @@ class ChatViewModel
             linkPreviewRepository.requestPreview(url)
         }
 
+        fun setAppForeground(foreground: Boolean) {
+            activeConversationTracker.setAppForeground(foreground)
+        }
+
         fun toggleRoomMute(roomJid: String) {
             val key = MuteRepository.roomKey(roomJid)
             viewModelScope.launch {
