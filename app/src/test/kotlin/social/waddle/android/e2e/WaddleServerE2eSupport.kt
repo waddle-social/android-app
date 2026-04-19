@@ -42,7 +42,7 @@ internal class WaddleServerContainer :
     private val databaseDirectory: Path = Files.createTempDirectory("waddle-e2e-db-")
 
     init {
-        addFixedExposedPort(HTTP_PORT, HTTP_PORT)
+        withExposedPorts(HTTP_PORT)
         withFileSystemBind(databaseDirectory.toString(), CONTAINER_DB_DIR, BindMode.READ_WRITE)
         withEnv("RUST_LOG", "warn,waddle_server=info")
         withEnv("WADDLE_BASE_URL", "http://127.0.0.1:$HTTP_PORT")
@@ -96,7 +96,7 @@ internal class WaddleServerContainer :
                 context = context as Context,
                 sessionProvider = Provider { sessionProvider },
             )
-        val gateway = RealWaddleGateway(WaddleApi(http), xmppClient)
+        val gateway = RealWaddleGateway(WaddleApi.forBaseUrl(http, httpBaseUrl), xmppClient)
         runBlocking { gateway.connect(session, session.environment) }
         return ProductionWaddleGateway(gateway, session, http)
     }
