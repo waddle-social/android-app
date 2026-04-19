@@ -30,6 +30,7 @@ import social.waddle.android.util.WaddleLog
 import social.waddle.android.xmpp.XmppClient
 import social.waddle.android.xmpp.XmppDirectMessage
 import social.waddle.android.xmpp.XmppHistoryMessage
+import java.time.Instant
 import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -53,6 +54,14 @@ class WaddleNotificationPoster
         private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         private val notificationManager = NotificationManagerCompat.from(context)
         private val conversations = ConcurrentHashMap<String, ConversationState>()
+
+        /**
+         * Set of message keys (`serverId ?: id`) we've already turned into
+         * notifications this process lifetime — protects against double-fire
+         * when the same stanza arrives twice (e.g., XEP-0198 resumption
+         * replay overlapping with a fresh live message).
+         */
+        private val postedKeys = ConcurrentHashMap.newKeySet<String>()
 
         // Snapshot of the muted set, hydrated eagerly once start() runs so the
         // stanza callbacks can read it synchronously without runBlocking.
@@ -95,6 +104,7 @@ class WaddleNotificationPoster
             directJob = null
             ownJid = null
             conversations.clear()
+            postedKeys.clear()
             notificationManager.cancelAll()
         }
 
@@ -117,13 +127,16 @@ class WaddleNotificationPoster
             if (!message.mentionsUser(ownLocalpart)) return
             if (activeConversation.isActive(ActiveConversation.Room(message.roomJid))) return
             if (isMuted(MuteRepository.roomKey(message.roomJid))) return
+            val messageKey = message.serverId ?: message.id
+            if (!postedKeys.add(messageKey)) return
+            if (isStale(message.createdAt)) return
             val senderName = message.senderName ?: "Someone"
             val body = message.body.takeIf { it.isNotBlank() } ?: "mentioned you"
             addAndPost(
                 key = ConversationKey.Room(message.roomJid),
                 senderName = senderName,
                 body = body,
-                timestamp = System.currentTimeMillis(),
+                timestamp = parseTimestamp(message.createdAt),
                 channelId = WaddleNotificationChannels.MENTIONS,
             )
         }
@@ -136,16 +149,35 @@ class WaddleNotificationPoster
             if (message.fromJid == ownBareJid) return
             if (activeConversation.isActive(ActiveConversation.Direct(message.peerJid))) return
             if (isMuted(MuteRepository.directKey(message.peerJid))) return
+            val messageKey = message.serverId ?: message.id
+            if (!postedKeys.add(messageKey)) return
+            if (isStale(message.createdAt)) return
             val senderName = message.senderName.ifBlank { message.peerJid.substringBefore('@') }
             val body = message.body.takeIf { it.isNotBlank() } ?: "New direct message"
             addAndPost(
                 key = ConversationKey.Direct(message.peerJid),
                 senderName = senderName,
                 body = body,
-                timestamp = System.currentTimeMillis(),
+                timestamp = parseTimestamp(message.createdAt),
                 channelId = WaddleNotificationChannels.MESSAGES,
             )
         }
+
+        /**
+         * A message is stale when its server timestamp is older than the
+         * "fresh" window — typically because the server re-delivered it on
+         * stream resumption or MUC rejoin-with-history. Notifying for these
+         * would flood the user every reconnect; we skip silently.
+         */
+        private fun isStale(createdAt: String): Boolean {
+            val stamp = runCatching { Instant.parse(createdAt).toEpochMilli() }.getOrNull() ?: return false
+            val ageMillis = System.currentTimeMillis() - stamp
+            return ageMillis > FRESH_WINDOW_MILLIS
+        }
+
+        private fun parseTimestamp(createdAt: String): Long =
+            runCatching { Instant.parse(createdAt).toEpochMilli() }
+                .getOrNull() ?: System.currentTimeMillis()
 
         private fun addAndPost(
             key: ConversationKey,
@@ -339,6 +371,14 @@ class WaddleNotificationPoster
             private const val GROUP_KEY = "waddle.messages"
             private const val SUMMARY_ID = 0x5355_4d4d // "SUMM"
             private const val MAX_MESSAGES_PER_CONVERSATION = 25
+
+            /**
+             * Messages older than this are considered replays from server-side
+             * backlog and do not trigger notifications. 2 minutes is generous
+             * enough to cover realistic network latency while still filtering
+             * out stream-resumption replays that can span minutes.
+             */
+            private const val FRESH_WINDOW_MILLIS = 2 * 60 * 1000L
         }
 
         enum class NotificationAction(
