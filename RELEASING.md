@@ -44,7 +44,9 @@ From the next CI run onwards, the APK is signed with this stable key and can be 
 
 ## Version codes
 
-`versionCode` comes from `${{ github.run_number }} + 1` in CI and `versionName` is `0.1.0+<run-number>-<short-sha>`. Every push to `main` increments `versionCode`, so Android will accept the update as long as the signature matches.
+`versionCode` is generated from UTC seconds since 2020-01-01 unless `VERSION_CODE` is set explicitly. CI uses the same timestamp scheme and sets `versionName` to `0.1.0+<run-number>-<short-sha>`. Local builds without an explicit code use `0.1.0+local.<versionCode>`, which makes the APK identifier visible when inspecting an installed build.
+
+Android accepts an APK update only when the application ID is unchanged, the signing certificate matches, and the new `versionCode` is not lower than the installed one. Keep debug and release APKs separate: debug builds install as `social.waddle.android.debug`, release builds install as `social.waddle.android`.
 
 ## Without the secrets
 

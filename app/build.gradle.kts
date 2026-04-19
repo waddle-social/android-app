@@ -1,5 +1,6 @@
 import dev.detekt.gradle.Detekt
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+import java.time.Instant
 
 plugins {
     alias(libs.plugins.android.application)
@@ -9,6 +10,18 @@ plugins {
     alias(libs.plugins.hilt)
     alias(libs.plugins.detekt)
     alias(libs.plugins.ktlint)
+}
+
+private val localVersionEpochSeconds = 1_577_836_800L
+private val maxAndroidVersionCode = 2_100_000_000L
+
+private fun parsePositiveVersionCode(value: String?): Int? = value?.toIntOrNull()?.takeIf { it > 0 }
+
+private fun generatedVersionCode(): Int {
+    val secondsSinceLocalEpoch = Instant.now().epochSecond - localVersionEpochSeconds
+    return secondsSinceLocalEpoch
+        .coerceIn(1L, maxAndroidVersionCode)
+        .toInt()
 }
 
 android {
@@ -54,9 +67,22 @@ android {
         minSdk = 26
         targetSdk = 36
         val baseVersionName = "0.1.0"
-        val runNumber = providers.environmentVariable("VERSION_CODE").orNull?.toIntOrNull() ?: 1
-        val versionSuffix = providers.environmentVariable("VERSION_SUFFIX").orNull
-        versionCode = runNumber
+        val configuredVersionCode =
+            parsePositiveVersionCode(providers.environmentVariable("VERSION_CODE").orNull)
+                ?: parsePositiveVersionCode(providers.gradleProperty("VERSION_CODE").orNull)
+        val resolvedVersionCode = configuredVersionCode ?: generatedVersionCode()
+        val versionSuffix =
+            providers
+                .environmentVariable("VERSION_SUFFIX")
+                .orElse(providers.gradleProperty("VERSION_SUFFIX"))
+                .orNull
+                ?.takeUnless { it.isBlank() }
+                ?: if (configuredVersionCode == null) {
+                    "local.$resolvedVersionCode"
+                } else {
+                    null
+                }
+        versionCode = resolvedVersionCode
         versionName =
             if (versionSuffix.isNullOrBlank()) {
                 baseVersionName

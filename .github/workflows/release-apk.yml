@@ -81,7 +81,8 @@ jobs:
       - name: Compute version info
         id: version
         run: |
-          VERSION_CODE=$((${{ github.run_number }} + 1))
+          LOCAL_VERSION_EPOCH_SECONDS=1577836800
+          VERSION_CODE=$(($(date -u +%s) - LOCAL_VERSION_EPOCH_SECONDS))
           SHORT_SHA=$(echo "${GITHUB_SHA}" | cut -c1-7)
           VERSION_SUFFIX="${{ github.run_number }}-${SHORT_SHA}"
           echo "VERSION_CODE=${VERSION_CODE}" >> "$GITHUB_ENV"
