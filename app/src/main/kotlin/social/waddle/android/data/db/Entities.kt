@@ -46,6 +46,8 @@ data class ChannelEntity(
     val topic: String?,
     val roomJid: String,
     val createdAt: String?,
+    /** XEP-0508: either "text" (default) or "forum". Sourced from room disco#info. */
+    val channelType: String,
 )
 
 @Entity(
@@ -79,6 +81,23 @@ data class MessageEntity(
     val callMuji: Boolean,
     val retracted: Boolean,
     val pending: Boolean,
+    /** XEP-0317 hats — newline-separated `uri|title` pairs. Null when the sender carries no hats. */
+    val hats: String?,
+    /** XEP-0201 Message Thread id this message belongs to. */
+    val threadId: String?,
+    /** XEP-0201 parent thread id when the thread is a sub-thread. */
+    val parentThreadId: String?,
+    /** XEP-0508 Forums: new-topic title when this message creates a forum topic. */
+    val forumTopicTitle: String?,
+    /** XEP-0508 Forums: thread id this message replies to in a forum. */
+    val forumReplyThreadId: String?,
+    /**
+     * The sender's `<message id="…">` origin id. Distinct from [serverId] (which
+     * holds the MUC-assigned XEP-0359 stanza-id) — peers use the origin id when
+     * cross-referencing (e.g. XEP-0508 `<thread-reply thread-id="…">`), so we
+     * need both IDs available for reconciliation.
+     */
+    val originStanzaId: String?,
 )
 
 @Entity(tableName = "dm_conversations")
@@ -93,17 +112,24 @@ data class DmConversationEntity(
 
 @Entity(
     tableName = "dm_messages",
-    indices = [Index("peerJid"), Index("serverId")],
+    indices = [Index("peerJid"), Index("serverId"), Index("originStanzaId")],
 )
 data class DmMessageEntity(
     @PrimaryKey val id: String,
     val serverId: String?,
+    /**
+     * Sender-chosen XEP-0359 origin-id / message id. Direct replies and
+     * reactions reference this ID when present, while [serverId] is kept for
+     * archive dedupe.
+     */
+    val originStanzaId: String?,
     val peerJid: String,
     val fromJid: String,
     val senderName: String,
     val body: String,
     val createdAt: String,
     val editedAt: String?,
+    val replyToMessageId: String?,
     val mentions: String?,
     val broadcastMention: String?,
     val sharedFileUrl: String?,
@@ -119,6 +145,12 @@ data class DmMessageEntity(
     val callMuji: Boolean,
     val retracted: Boolean,
     val pending: Boolean,
+    /** XEP-0317 hats — newline-separated `uri|title` pairs. Null when the peer carries no hats. */
+    val hats: String?,
+    /** XEP-0201 Message Thread id this DM belongs to. */
+    val threadId: String?,
+    /** XEP-0201 parent thread id when the thread is a sub-thread. */
+    val parentThreadId: String?,
 )
 
 @Entity(

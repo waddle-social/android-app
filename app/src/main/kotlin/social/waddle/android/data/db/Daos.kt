@@ -93,14 +93,26 @@ interface MessageDao {
     @Query("UPDATE messages SET pending = 0 WHERE id = :localId")
     suspend fun clearPending(localId: String)
 
-    @Query("UPDATE messages SET body = :body, editedAt = :editedAt WHERE id = :messageId OR serverId = :messageId")
+    @Query(
+        """
+        UPDATE messages
+        SET body = :body, editedAt = :editedAt
+        WHERE id = :messageId OR serverId = :messageId OR originStanzaId = :messageId
+        """,
+    )
     suspend fun markEdited(
         messageId: String,
         body: String,
         editedAt: String,
     )
 
-    @Query("UPDATE messages SET retracted = 1, body = '' WHERE id = :messageId OR serverId = :messageId")
+    @Query(
+        """
+        UPDATE messages
+        SET retracted = 1, body = ''
+        WHERE id = :messageId OR serverId = :messageId OR originStanzaId = :messageId
+        """,
+    )
     suspend fun markRetracted(messageId: String)
 }
 
@@ -148,14 +160,26 @@ interface DmMessageDao {
     @Query("UPDATE dm_messages SET pending = 0 WHERE id = :localId")
     suspend fun clearPending(localId: String)
 
-    @Query("UPDATE dm_messages SET body = :body, editedAt = :editedAt WHERE id = :messageId OR serverId = :messageId")
+    @Query(
+        """
+        UPDATE dm_messages
+        SET body = :body, editedAt = :editedAt
+        WHERE id = :messageId OR serverId = :messageId OR originStanzaId = :messageId
+        """,
+    )
     suspend fun markEdited(
         messageId: String,
         body: String,
         editedAt: String,
     )
 
-    @Query("UPDATE dm_messages SET retracted = 1, body = '' WHERE id = :messageId OR serverId = :messageId")
+    @Query(
+        """
+        UPDATE dm_messages
+        SET retracted = 1, body = ''
+        WHERE id = :messageId OR serverId = :messageId OR originStanzaId = :messageId
+        """,
+    )
     suspend fun markRetracted(messageId: String)
 
     @Query("DELETE FROM dm_messages")
@@ -183,7 +207,10 @@ interface ReactionDao {
         """
         SELECT reactions.messageId AS messageId, reactions.emoji AS emoji, COUNT(*) AS count
         FROM reactions
-        INNER JOIN messages ON reactions.messageId = messages.id OR reactions.messageId = messages.serverId
+        INNER JOIN messages
+            ON reactions.messageId = messages.id
+            OR reactions.messageId = messages.serverId
+            OR reactions.messageId = messages.originStanzaId
         WHERE messages.channelId = :channelId
         GROUP BY reactions.messageId, reactions.emoji
         ORDER BY MIN(reactions.createdAt) ASC
@@ -231,7 +258,10 @@ interface DmReactionDao {
         """
         SELECT dm_reactions.messageId AS messageId, dm_reactions.emoji AS emoji, COUNT(*) AS count
         FROM dm_reactions
-        INNER JOIN dm_messages ON dm_reactions.messageId = dm_messages.id OR dm_reactions.messageId = dm_messages.serverId
+        INNER JOIN dm_messages
+            ON dm_reactions.messageId = dm_messages.id
+            OR dm_reactions.messageId = dm_messages.serverId
+            OR dm_reactions.messageId = dm_messages.originStanzaId
         WHERE dm_messages.peerJid = :peerJid
         GROUP BY dm_reactions.messageId, dm_reactions.emoji
         ORDER BY MIN(dm_reactions.createdAt) ASC

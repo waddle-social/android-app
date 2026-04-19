@@ -128,9 +128,21 @@ data class ChatMessageDraft(
     val body: String,
     val stanzaId: String? = null,
     val replyToMessageId: String? = null,
+    val replyToSenderJid: String? = null,
+    val replyToFallbackBody: String? = null,
     val correctionMessageId: String? = null,
     val mentions: List<String> = emptyList(),
     val sharedFile: ChatFileAttachment? = null,
+    /** XEP-0449 Stickers: if non-null, attach a sticker element with this pack id. */
+    val stickerPack: String? = null,
+    /** XEP-0201 Thread: include a `<thread>` element with this id. */
+    val threadId: String? = null,
+    /** XEP-0201 Thread parent: include `parent` attribute on the `<thread>` element. */
+    val parentThreadId: String? = null,
+    /** XEP-0508 Forums: emit `<thread-create title='…'/>` for a new forum topic. */
+    val forumTopicTitle: String? = null,
+    /** XEP-0508 Forums: emit `<thread-reply thread-id='…'/>` for a reply in an existing forum topic. */
+    val forumReplyThreadId: String? = null,
 )
 
 data class ChatFileAttachment(

@@ -47,6 +47,7 @@ import social.waddle.android.data.network.WaddleApi
 import social.waddle.android.util.WaddleLog
 import social.waddle.android.xmpp.ChatState
 import social.waddle.android.xmpp.SessionProvider
+import social.waddle.android.xmpp.WaddleHat
 import social.waddle.android.xmpp.XmppClient
 import social.waddle.android.xmpp.XmppConnectionState
 import social.waddle.android.xmpp.XmppDirectMessage
@@ -100,6 +101,17 @@ class ChatRepository
         fun observeDirectTyping(): StateFlow<Map<String, Boolean>> = mutableDirectTyping.asStateFlow()
 
         fun observePresences(): StateFlow<Map<String, Boolean>> = xmppClient.presences
+
+        /** XEP-0502 Activity Indicator: set of room JIDs the server has marked as recently active. */
+        fun observeActiveRoomJids(): StateFlow<Set<String>> = xmppClient.activeRoomJids
+
+        /** Clear the given room from the activity set after the user visits it (client-side only). */
+        fun clearRoomActivity(roomJid: String) {
+            xmppClient.clearRoomActivity(roomJid)
+        }
+
+        suspend fun channelByIdSnapshot(channelId: String): ChannelEntity? =
+            withContext(Dispatchers.IO) { channelDao.getChannel(channelId) }
 
         fun observeDmConversations(): Flow<List<DmConversationEntity>> = dmConversationDao.observeConversations()
 
@@ -170,6 +182,9 @@ class ChatRepository
             session: StoredSession,
             waddleId: String,
         ) = withContext(Dispatchers.IO) {
+            // XMPP disco is authoritative — channel_type is derived from the
+            // room's disco#info features (XEP-0508 `urn:xmpp:forums:0`). No
+            // REST fallback; per CLAUDE.md we're XMPP-native.
             val channels =
                 xmppClient.discoverChannels(session, waddleId).map { ref ->
                     ChannelEntity(
@@ -179,6 +194,7 @@ class ChatRepository
                         topic = null,
                         roomJid = ref.roomJid,
                         createdAt = null,
+                        channelType = ref.channelType,
                     )
                 }
             channelDao.upsertAll(channels)
@@ -441,6 +457,9 @@ class ChatRepository
             session: StoredSession,
             peerJid: String,
             body: String,
+            replyToMessageId: String? = null,
+            replyToSenderJid: String? = null,
+            replyToFallbackBody: String? = null,
         ) = withContext(Dispatchers.IO) {
             val localId = UUID.randomUUID().toString()
             val now = Instant.now().toString()
@@ -448,12 +467,14 @@ class ChatRepository
                 DmMessageEntity(
                     id = localId,
                     serverId = null,
+                    originStanzaId = localId,
                     peerJid = peerJid,
                     fromJid = session.jid,
                     senderName = session.username,
                     body = body,
                     createdAt = now,
                     editedAt = null,
+                    replyToMessageId = replyToMessageId,
                     mentions = null,
                     broadcastMention = null,
                     sharedFileUrl = null,
@@ -469,10 +490,20 @@ class ChatRepository
                     callMuji = false,
                     retracted = false,
                     pending = true,
+                    hats = null,
+                    threadId = null,
+                    parentThreadId = null,
                 )
             dmMessageDao.upsert(message)
             upsertConversation(message)
-            xmppClient.sendDirectMessage(peerJid, body, localId)
+            xmppClient.sendDirectMessage(
+                peerJid = peerJid,
+                body = body,
+                stanzaId = localId,
+                replyToMessageId = replyToMessageId,
+                replyToSenderJid = replyToSenderJid,
+                replyToFallbackBody = replyToFallbackBody,
+            )
             dmMessageDao.clearPending(localId)
         }
 
@@ -489,12 +520,14 @@ class ChatRepository
                 DmMessageEntity(
                     id = localId,
                     serverId = null,
+                    originStanzaId = localId,
                     peerJid = peerJid,
                     fromJid = session.jid,
                     senderName = session.username,
                     body = body,
                     createdAt = now,
                     editedAt = null,
+                    replyToMessageId = null,
                     mentions = null,
                     broadcastMention = null,
                     sharedFileUrl = sharedFile.url,
@@ -510,6 +543,9 @@ class ChatRepository
                     callMuji = false,
                     retracted = false,
                     pending = true,
+                    hats = null,
+                    threadId = null,
+                    parentThreadId = null,
                 )
             dmMessageDao.upsert(message)
             upsertConversation(message)
@@ -576,6 +612,10 @@ class ChatRepository
             channelId: String,
             body: String,
             replyToMessageId: String? = null,
+            replyToSenderJid: String? = null,
+            replyToFallbackBody: String? = null,
+            forumTopicTitle: String? = null,
+            forumReplyThreadId: String? = null,
         ) = withContext(Dispatchers.IO) {
             val channel = requireNotNull(channelDao.getChannel(channelId)) { "Channel $channelId is not cached." }
             val localId = UUID.randomUUID().toString()
@@ -587,6 +627,10 @@ class ChatRepository
                     body = body,
                     stanzaId = localId,
                     replyToMessageId = replyToMessageId,
+                    replyToSenderJid = replyToSenderJid,
+                    replyToFallbackBody = replyToFallbackBody,
+                    forumTopicTitle = forumTopicTitle,
+                    forumReplyThreadId = forumReplyThreadId,
                 )
             messageDao.upsert(
                 MessageEntity(
@@ -616,6 +660,12 @@ class ChatRepository
                     callMuji = false,
                     retracted = false,
                     pending = true,
+                    hats = null,
+                    threadId = null,
+                    parentThreadId = null,
+                    forumTopicTitle = forumTopicTitle,
+                    forumReplyThreadId = forumReplyThreadId,
+                    originStanzaId = localId,
                 ),
             )
             pendingOutboundDao.upsert(
@@ -681,6 +731,12 @@ class ChatRepository
                     callMuji = false,
                     retracted = false,
                     pending = true,
+                    hats = null,
+                    threadId = null,
+                    parentThreadId = null,
+                    forumTopicTitle = null,
+                    forumReplyThreadId = null,
+                    originStanzaId = localId,
                 ),
             )
             xmppClient.sendGroupMessage(draft)
@@ -1136,18 +1192,26 @@ class ChatRepository
                 callMuji = callInvite?.muji ?: false,
                 retracted = false,
                 pending = false,
+                hats = hats.encodeHats(),
+                threadId = threadId,
+                parentThreadId = parentThreadId,
+                forumTopicTitle = forumTopicTitle,
+                forumReplyThreadId = forumReplyThreadId,
+                originStanzaId = originStanzaId,
             )
 
         private fun XmppDirectMessage.toEntity(id: String = this.id): DmMessageEntity =
             DmMessageEntity(
                 id = id,
                 serverId = serverId,
+                originStanzaId = originStanzaId,
                 peerJid = peerJid,
                 fromJid = fromJid,
                 senderName = senderName,
                 body = body,
                 createdAt = createdAt,
                 editedAt = editedAt,
+                replyToMessageId = replyToMessageId,
                 mentions = mentions.joinToStringOrNull(),
                 broadcastMention = broadcastMention,
                 sharedFileUrl = sharedFile?.url,
@@ -1163,7 +1227,17 @@ class ChatRepository
                 callMuji = callInvite?.muji ?: false,
                 retracted = false,
                 pending = false,
+                hats = hats.encodeHats(),
+                threadId = threadId,
+                parentThreadId = parentThreadId,
             )
+
+        private fun List<WaddleHat>.encodeHats(): String? =
+            if (isEmpty()) {
+                null
+            } else {
+                joinToString("\n") { hat -> "${hat.uri}|${hat.title}" }
+            }
 
         private fun XmppHistoryMessage.isTimelineMessage(): Boolean =
             reactionTargetId == null &&

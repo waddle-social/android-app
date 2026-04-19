@@ -45,6 +45,7 @@ import javax.inject.Inject
 enum class ChatMode {
     Rooms,
     DirectMessages,
+    Discover,
 }
 
 data class ChatUiState(
@@ -52,6 +53,7 @@ data class ChatUiState(
     val selectedWaddleId: String? = null,
     val selectedChannelId: String? = null,
     val selectedDmPeerJid: String? = null,
+    val selectedThreadRootId: String? = null,
     val searchVisible: Boolean = false,
     val searchQuery: String = "",
     val dmSearchQuery: String = "",
@@ -168,6 +170,12 @@ class ChatViewModel
                 .observePresences()
                 .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyMap())
 
+        /** XEP-0502 Activity Indicator: room JIDs with unseen activity. */
+        val activeRoomJids: StateFlow<Set<String>> =
+            repository
+                .observeActiveRoomJids()
+                .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptySet())
+
         val linkPreviews: StateFlow<Map<String, LinkPreview>> = linkPreviewRepository.previews
 
         fun requestLinkPreview(url: String) {
@@ -192,23 +200,35 @@ class ChatViewModel
 
         private val mutableRoomReply = MutableStateFlow<String?>(null)
         val replyToMessageId: StateFlow<String?> = mutableRoomReply.asStateFlow()
+        private var roomReplySenderJid: String? = null
+        private var roomReplyFallbackBody: String? = null
         private val mutableDirectReply = MutableStateFlow<String?>(null)
         val replyToDirectMessageId: StateFlow<String?> = mutableDirectReply.asStateFlow()
+        private var directReplySenderJid: String? = null
+        private var directReplyFallbackBody: String? = null
 
         fun startRoomReply(message: MessageEntity) {
-            mutableRoomReply.value = message.serverId ?: message.id
+            mutableRoomReply.value = message.serverId ?: message.originStanzaId ?: message.id
+            roomReplySenderJid = message.senderId?.takeIf { it.contains('@') }
+            roomReplyFallbackBody = message.body
         }
 
         fun clearRoomReply() {
             mutableRoomReply.value = null
+            roomReplySenderJid = null
+            roomReplyFallbackBody = null
         }
 
         fun startDirectReply(message: DmMessageEntity) {
-            mutableDirectReply.value = message.serverId ?: message.id
+            mutableDirectReply.value = message.originStanzaId ?: message.id
+            directReplySenderJid = message.fromJid
+            directReplyFallbackBody = message.body
         }
 
         fun clearDirectReply() {
             mutableDirectReply.value = null
+            directReplySenderJid = null
+            directReplyFallbackBody = null
         }
 
         private var connectedSessionId: String? = null
@@ -245,11 +265,31 @@ class ChatViewModel
         }
 
         fun showRooms() {
+            clearDirectReply()
             mutableState.update { it.copy(mode = ChatMode.Rooms, error = null) }
         }
 
         fun showDirectMessages() {
             mutableState.update { it.copy(mode = ChatMode.DirectMessages, error = null) }
+        }
+
+        fun showDiscover(session: AuthSession) {
+            currentSession = session
+            mutableState.update { it.copy(mode = ChatMode.Discover, error = null) }
+            loadPublicWaddles(session)
+        }
+
+        fun openThread(rootMessageKey: String) {
+            mutableState.update { it.copy(selectedThreadRootId = rootMessageKey, error = null) }
+            mutableRoomReply.value = rootMessageKey
+        }
+
+        fun closeThread() {
+            val rootKey = mutableState.value.selectedThreadRootId
+            mutableState.update { it.copy(selectedThreadRootId = null, error = null) }
+            if (mutableRoomReply.value == rootKey) {
+                mutableRoomReply.value = null
+            }
         }
 
         fun start(session: AuthSession) {
@@ -288,8 +328,10 @@ class ChatViewModel
             currentSession = session
             mutableState.update {
                 it.copy(
+                    mode = ChatMode.Rooms,
                     selectedWaddleId = waddleId,
                     selectedChannelId = null,
+                    selectedThreadRootId = null,
                     searchVisible = false,
                     searchQuery = "",
                     error = null,
@@ -306,11 +348,13 @@ class ChatViewModel
             mutableState.update {
                 it.copy(
                     selectedChannelId = null,
+                    selectedThreadRootId = null,
                     searchVisible = false,
                     searchQuery = "",
                     error = null,
                 )
             }
+            mutableRoomReply.value = null
         }
 
         fun selectChannel(
@@ -319,8 +363,10 @@ class ChatViewModel
         ) {
             mutableState.update {
                 it.copy(
+                    mode = ChatMode.Rooms,
                     selectedWaddleId = waddleId,
                     selectedChannelId = channelId,
+                    selectedThreadRootId = null,
                     searchQuery = "",
                     error = null,
                 )
@@ -329,6 +375,8 @@ class ChatViewModel
                 runCatching {
                     val session = currentSession ?: return@runCatching
                     repository.refreshMessages(channelId)
+                    // XEP-0502: reading the channel clears its activity badge.
+                    repository.channelByIdSnapshot(channelId)?.roomJid?.let(repository::clearRoomActivity)
                     // Preload members so @mention autocomplete has data to match against.
                     // Fire-and-forget; failure is non-fatal.
                     runCatching {
@@ -398,6 +446,9 @@ class ChatViewModel
             peerJid: String,
         ) {
             currentSession = session
+            if (mutableState.value.selectedDmPeerJid != peerJid) {
+                clearDirectReply()
+            }
             mutableState.update {
                 it.copy(
                     mode = ChatMode.DirectMessages,
@@ -427,6 +478,7 @@ class ChatViewModel
         }
 
         fun clearDirectMessageSelection() {
+            clearDirectReply()
             mutableState.update { it.copy(selectedDmPeerJid = null, error = null) }
         }
 
@@ -435,10 +487,21 @@ class ChatViewModel
             body: String,
         ) {
             val peerJid = mutableState.value.selectedDmPeerJid ?: return
+            val replyTo = mutableDirectReply.value
+            val replyToSenderJid = directReplySenderJid
+            val replyToFallbackBody = directReplyFallbackBody
             viewModelScope.launch {
                 mutableState.update { it.copy(sending = true, error = null) }
                 runCatching {
-                    repository.sendDirectMessage(session.stored, peerJid, body.trim())
+                    repository.sendDirectMessage(
+                        session = session.stored,
+                        peerJid = peerJid,
+                        body = body.trim(),
+                        replyToMessageId = replyTo,
+                        replyToSenderJid = replyToSenderJid,
+                        replyToFallbackBody = replyToFallbackBody,
+                    )
+                    clearDirectReply()
                     draftRepository.setDirectDraft(peerJid, "")
                 }.onFailure(::showError)
                 mutableState.update { it.copy(sending = false) }
@@ -733,9 +796,19 @@ class ChatViewModel
             session: AuthSession,
             body: String,
         ) {
-            val selectedWaddleId = mutableState.value.selectedWaddleId ?: return
-            val selectedChannelId = mutableState.value.selectedChannelId ?: return
-            val replyTo = mutableRoomReply.value
+            val snapshot = mutableState.value
+            val selectedWaddleId = snapshot.selectedWaddleId ?: return
+            val selectedChannelId = snapshot.selectedChannelId ?: return
+            // Inside a thread, every message is a reply to the root —
+            // even if the user dismissed the reply preview, we pin it.
+            val replyTo = snapshot.selectedThreadRootId ?: mutableRoomReply.value
+            // XEP-0508: forum channels use <thread-reply thread-id='…'/> instead of
+            // XEP-0461 replies when the user is inside a thread. We decide that at
+            // send time so callers don't need to branch.
+            val isForum = channels.value.firstOrNull { it.id == selectedChannelId }?.channelType == "forum"
+            val forumReplyThread = snapshot.selectedThreadRootId?.takeIf { isForum }
+            val replyToSenderJid = roomReplySenderJid
+            val replyToFallbackBody = roomReplyFallbackBody
             viewModelScope.launch {
                 mutableState.update { it.copy(sending = true, error = null) }
                 runCatching {
@@ -744,10 +817,46 @@ class ChatViewModel
                         waddleId = selectedWaddleId,
                         channelId = selectedChannelId,
                         body = body.trim(),
-                        replyToMessageId = replyTo,
+                        replyToMessageId = replyTo.takeIf { forumReplyThread == null },
+                        replyToSenderJid = replyToSenderJid.takeIf { forumReplyThread == null },
+                        replyToFallbackBody = replyToFallbackBody.takeIf { forumReplyThread == null },
+                        forumReplyThreadId = forumReplyThread,
                     )
                     draftRepository.setChannelDraft(selectedChannelId, "")
-                    mutableRoomReply.value = null
+                    mutableRoomReply.value = snapshot.selectedThreadRootId
+                    roomReplySenderJid = null
+                    roomReplyFallbackBody = null
+                }.onFailure(::showError)
+                mutableState.update { it.copy(sending = false) }
+            }
+        }
+
+        /**
+         * XEP-0508: post a new forum topic. The composer supplies the title
+         * separately from the body; the repository builds a `<thread-create
+         * title='…'/>`-bearing message.
+         */
+        fun sendForumTopic(
+            session: AuthSession,
+            title: String,
+            body: String,
+        ) {
+            val snapshot = mutableState.value
+            val selectedWaddleId = snapshot.selectedWaddleId ?: return
+            val selectedChannelId = snapshot.selectedChannelId ?: return
+            if (title.isBlank() || body.isBlank()) return
+            viewModelScope.launch {
+                mutableState.update { it.copy(sending = true, error = null) }
+                runCatching {
+                    repository.sendMessage(
+                        session = session.stored,
+                        waddleId = selectedWaddleId,
+                        channelId = selectedChannelId,
+                        body = body.trim(),
+                        replyToMessageId = null,
+                        forumTopicTitle = title.trim(),
+                    )
+                    draftRepository.setChannelDraft(selectedChannelId, "")
                 }.onFailure(::showError)
                 mutableState.update { it.copy(sending = false) }
             }

@@ -2,6 +2,7 @@ package social.waddle.android.xmpp
 
 import org.jivesoftware.smack.packet.Message
 import org.jivesoftware.smack.packet.StandardExtensionElement
+import org.jivesoftware.smackx.delay.packet.DelayInformation
 import org.jivesoftware.smackx.mam.element.MamElements
 import org.jivesoftware.smackx.sid.element.StanzaIdElement
 import java.time.Instant
@@ -18,17 +19,48 @@ internal class XmppMessageMapper(
         if (MamElements.MamResultExtension.from(message) != null) {
             return null
         }
-        val createdAt = Instant.now().toString()
+        // Prefer a XEP-0203 <delay> stamp when present — that's the real server
+        // receive time, not "now". This is how we tell re-delivered backlog
+        // (stream resumption / MUC rejoin history) apart from live messages.
+        val createdAt = message.effectiveCreatedAt()
         val senderName = message.historySenderName()
         return roomMessageFrom(
             message = message,
             roomJid = roomJid,
             createdAt = createdAt,
-            serverId = liveMessageId(message),
-            originStanzaId = message.stanzaId.nonBlank(),
+            serverId = roomStableMessageId(message, roomJid),
+            originStanzaId = message.effectiveOriginId(),
             senderName = senderName,
         )
     }
+
+    /**
+     * The sender-chosen origin id. Prefer XEP-0359 `<origin-id xmlns="urn:xmpp:sid:0"/>`
+     * and fall back to the `<message id="...">` attribute when the extension is
+     * absent. This is useful for pending-row reconciliation and direct-message
+     * references, but it is sender-controlled and must not be treated like a
+     * trusted server-assigned stanza-id.
+     */
+    private fun Message.effectiveOriginId(): String? {
+        val explicit =
+            (getExtensionElement("origin-id", ORIGIN_ID_NAMESPACE) as? StandardExtensionElement)
+                ?.getAttributeValue("id")
+                ?.takeIf { it.isNotBlank() }
+        return explicit ?: stanzaId.nonBlank()
+    }
+
+    /**
+     * Returns the message's server-side stamp if it carries a XEP-0203 `<delay>`,
+     * otherwise the current instant. Used so re-delivered messages on reconnect
+     * carry a real timestamp rather than masquerading as fresh arrivals.
+     */
+    private fun Message.effectiveCreatedAt(): String =
+        DelayInformation
+            .from(this)
+            ?.stamp
+            ?.toInstant()
+            ?.toString()
+            ?: Instant.now().toString()
 
     fun roomMessageFromMam(
         result: MamElements.MamResultExtension,
@@ -46,8 +78,8 @@ internal class XmppMessageMapper(
             message = message,
             roomJid = roomJid,
             createdAt = createdAt,
-            serverId = stableMessageId(result, message),
-            originStanzaId = message.stanzaId.nonBlank(),
+            serverId = roomStableMessageId(message, roomJid),
+            originStanzaId = message.effectiveOriginId(),
             senderName = message.historySenderName(),
         )
     }
@@ -70,9 +102,9 @@ internal class XmppMessageMapper(
             message = message,
             ownBareJid = ownBareJid,
             peerJid = peerJid,
-            createdAt = Instant.now().toString(),
-            serverId = liveMessageId(message),
-            originStanzaId = message.stanzaId.nonBlank(),
+            createdAt = message.effectiveCreatedAt(),
+            serverId = directStableMessageId(message, trustedDirectStanzaIdAssigners(message, ownBareJid, peerJid)),
+            originStanzaId = message.effectiveOriginId(),
         )
     }
 
@@ -94,8 +126,8 @@ internal class XmppMessageMapper(
             ownBareJid = ownBareJid,
             peerJid = peerJid,
             createdAt = createdAt,
-            serverId = stableMessageId(result, message),
-            originStanzaId = message.stanzaId.nonBlank(),
+            serverId = directStableMessageId(message, trustedDirectStanzaIdAssigners(message, ownBareJid, peerJid)),
+            originStanzaId = message.effectiveOriginId(),
         )
     }
 
@@ -129,12 +161,11 @@ internal class XmppMessageMapper(
             ownBareJid = ownBareJid,
             peerJid = peerJid,
             createdAt = createdAt,
-            serverId = stableMessageId(result, message),
-            originStanzaId = message.stanzaId.nonBlank(),
+            serverId = directStableMessageId(message, trustedDirectStanzaIdAssigners(message, ownBareJid, peerJid)),
+            originStanzaId = message.effectiveOriginId(),
         )
     }
 
-    @Suppress("CyclomaticComplexMethod")
     private fun roomMessageFrom(
         message: Message,
         roomJid: String,
@@ -143,67 +174,16 @@ internal class XmppMessageMapper(
         originStanzaId: String?,
         senderName: String?,
     ): XmppHistoryMessage? {
-        message.displayedTargetId()?.let { displayedId ->
-            return XmppHistoryMessage(
-                id = serverId ?: fallbackMessageId(roomJid, createdAt, "displayed:$displayedId"),
-                serverId = serverId,
-                originStanzaId = originStanzaId,
-                roomJid = roomJid,
-                senderId = senderIdFor(message, senderName),
-                senderName = displayNameFor(senderName),
-                body = "",
-                createdAt = createdAt,
-                displayedId = displayedId,
-            )
-        }
-
-        message.chatState()?.let { chatState ->
-            return XmppHistoryMessage(
-                id = serverId ?: fallbackMessageId(roomJid, createdAt, "chat-state:$chatState"),
-                serverId = serverId,
-                originStanzaId = originStanzaId,
-                roomJid = roomJid,
-                senderId = senderIdFor(message, senderName),
-                senderName = displayNameFor(senderName),
-                body = "",
-                createdAt = createdAt,
-                chatState = chatState,
-            )
-        }
-
-        message.reactionUpdate()?.let { reaction ->
-            return XmppHistoryMessage(
-                id = serverId ?: fallbackMessageId(roomJid, createdAt, "reaction:${reaction.targetId}"),
-                serverId = serverId,
-                originStanzaId = originStanzaId,
-                roomJid = roomJid,
-                senderId = senderIdFor(message, senderName),
-                senderName = displayNameFor(senderName),
-                body = "",
-                createdAt = createdAt,
-                reactionTargetId = reaction.targetId,
-                reactionEmojis = reaction.emojis,
-            )
-        }
-
-        message.retractionTargetId()?.let { retractsId ->
-            return XmppHistoryMessage(
-                id = serverId ?: fallbackMessageId(roomJid, createdAt, "retract:$retractsId"),
-                serverId = serverId,
-                originStanzaId = originStanzaId,
-                roomJid = roomJid,
-                senderId = senderIdFor(message, senderName),
-                senderName = displayNameFor(senderName),
-                body = "",
-                createdAt = createdAt,
-                retractsId = retractsId,
-            )
-        }
+        roomUpdateMessage(message, roomJid, createdAt, serverId, originStanzaId, senderName)?.let { return it }
 
         val sharedFile = message.sharedFile()
-        val callInvite = message.callInvite(serverId ?: message.stanzaId ?: fallbackMessageId(roomJid, createdAt, "call"))
+        val messageId = serverId ?: originStanzaId ?: fallbackMessageId(roomJid, createdAt, "message")
+        val callInvite = message.callInvite(messageId)
         val body =
-            message.body?.takeIf { it.isNotBlank() }
+            message.body
+                ?.takeIf { it.isNotBlank() }
+                ?.stripFallbacks(message, REPLY_NAMESPACE, FILE_SHARING_NAMESPACE)
+                ?.takeIf { it.isNotBlank() }
                 ?: sharedFile?.description?.takeIf { it.isNotBlank() }
                 ?: sharedFile?.name?.takeIf { it.isNotBlank() }
                 ?: sharedFile?.url?.takeIf { it.isNotBlank() }
@@ -211,7 +191,7 @@ internal class XmppMessageMapper(
                 ?: callInvite?.externalUri?.takeIf { it.isNotBlank() }
                 ?: return null
         return XmppHistoryMessage(
-            id = serverId ?: fallbackMessageId(roomJid, createdAt, body),
+            id = serverId ?: originStanzaId ?: fallbackMessageId(roomJid, createdAt, body),
             serverId = serverId,
             originStanzaId = originStanzaId,
             roomJid = roomJid,
@@ -226,10 +206,40 @@ internal class XmppMessageMapper(
             isSticker = message.isSticker(),
             callInvite = callInvite,
             replacesId = message.correctionTargetId(),
+            hats = message.hats(),
+            threadId = message.threadId(),
+            parentThreadId = null,
+            forumTopicTitle = message.forumTopicTitle(),
+            forumReplyThreadId = message.forumReplyThreadId(),
+            markupRanges = message.markupRanges(),
         )
     }
 
-    @Suppress("CyclomaticComplexMethod")
+    private fun roomUpdateMessage(
+        message: Message,
+        roomJid: String,
+        createdAt: String,
+        serverId: String?,
+        originStanzaId: String?,
+        senderName: String?,
+    ): XmppHistoryMessage? {
+        val base =
+            RoomMessageBase(
+                idPrefix = roomJid,
+                createdAt = createdAt,
+                serverId = serverId,
+                originStanzaId = originStanzaId,
+                roomJid = roomJid,
+                senderId = senderIdFor(message, senderName),
+                senderName = displayNameFor(senderName),
+            )
+        message.displayedTargetId()?.let { return base.displayed(it) }
+        message.chatState()?.let { return base.chatState(it) }
+        message.reactionUpdate()?.let { return base.reaction(it) }
+        message.retractionTargetId()?.let { return base.retraction(it) }
+        return null
+    }
+
     private fun directMessageFrom(
         message: Message,
         ownBareJid: String,
@@ -239,67 +249,16 @@ internal class XmppMessageMapper(
         originStanzaId: String?,
     ): XmppDirectMessage? {
         val fromBare = message.from?.toString()?.bareJid() ?: return null
-        message.displayedTargetId()?.let { displayedId ->
-            return XmppDirectMessage(
-                id = serverId ?: fallbackMessageId(peerJid, createdAt, "dm-displayed:$displayedId"),
-                serverId = serverId,
-                originStanzaId = originStanzaId,
-                peerJid = peerJid,
-                fromJid = fromBare,
-                senderName = directSenderName(fromBare, ownBareJid, peerJid),
-                body = "",
-                createdAt = createdAt,
-                displayedId = displayedId,
-            )
-        }
-
-        message.chatState()?.let { chatState ->
-            return XmppDirectMessage(
-                id = serverId ?: fallbackMessageId(peerJid, createdAt, "dm-chat-state:$chatState"),
-                serverId = serverId,
-                originStanzaId = originStanzaId,
-                peerJid = peerJid,
-                fromJid = fromBare,
-                senderName = directSenderName(fromBare, ownBareJid, peerJid),
-                body = "",
-                createdAt = createdAt,
-                chatState = chatState,
-            )
-        }
-
-        message.reactionUpdate()?.let { reaction ->
-            return XmppDirectMessage(
-                id = serverId ?: fallbackMessageId(peerJid, createdAt, "dm-reaction:${reaction.targetId}"),
-                serverId = serverId,
-                originStanzaId = originStanzaId,
-                peerJid = peerJid,
-                fromJid = fromBare,
-                senderName = directSenderName(fromBare, ownBareJid, peerJid),
-                body = "",
-                createdAt = createdAt,
-                reactionTargetId = reaction.targetId,
-                reactionEmojis = reaction.emojis,
-            )
-        }
-
-        message.retractionTargetId()?.let { retractsId ->
-            return XmppDirectMessage(
-                id = serverId ?: fallbackMessageId(peerJid, createdAt, "dm-retract:$retractsId"),
-                serverId = serverId,
-                originStanzaId = originStanzaId,
-                peerJid = peerJid,
-                fromJid = fromBare,
-                senderName = directSenderName(fromBare, ownBareJid, peerJid),
-                body = "",
-                createdAt = createdAt,
-                retractsId = retractsId,
-            )
-        }
+        directUpdateMessage(message, peerJid, fromBare, ownBareJid, createdAt, serverId, originStanzaId)?.let { return it }
 
         val sharedFile = message.sharedFile()
-        val callInvite = message.callInvite(serverId ?: message.stanzaId ?: fallbackMessageId(peerJid, createdAt, "dm-call"))
+        val messageId = serverId ?: originStanzaId ?: fallbackMessageId(peerJid, createdAt, "dm-message")
+        val callInvite = message.callInvite(messageId)
         val body =
-            message.body?.takeIf { it.isNotBlank() }
+            message.body
+                ?.takeIf { it.isNotBlank() }
+                ?.stripFallbacks(message, REPLY_NAMESPACE, FILE_SHARING_NAMESPACE)
+                ?.takeIf { it.isNotBlank() }
                 ?: sharedFile?.description?.takeIf { it.isNotBlank() }
                 ?: sharedFile?.name?.takeIf { it.isNotBlank() }
                 ?: sharedFile?.url?.takeIf { it.isNotBlank() }
@@ -307,7 +266,7 @@ internal class XmppMessageMapper(
                 ?: callInvite?.externalUri?.takeIf { it.isNotBlank() }
                 ?: return null
         return XmppDirectMessage(
-            id = serverId ?: fallbackMessageId(peerJid, createdAt, body),
+            id = serverId ?: originStanzaId ?: fallbackMessageId(peerJid, createdAt, body),
             serverId = serverId,
             originStanzaId = originStanzaId,
             peerJid = peerJid,
@@ -315,13 +274,138 @@ internal class XmppMessageMapper(
             senderName = directSenderName(fromBare, ownBareJid, peerJid),
             body = body,
             createdAt = createdAt,
+            replyToMessageId = message.replyTargetId(),
             mentions = message.mentionUris(),
             broadcastMention = message.broadcastMention(),
             sharedFile = sharedFile,
             isSticker = message.isSticker(),
             callInvite = callInvite,
             replacesId = message.correctionTargetId(),
+            hats = message.hats(),
+            threadId = message.threadId(),
+            parentThreadId = null,
+            markupRanges = message.markupRanges(),
         )
+    }
+
+    private fun directUpdateMessage(
+        message: Message,
+        peerJid: String,
+        fromBare: String,
+        ownBareJid: String,
+        createdAt: String,
+        serverId: String?,
+        originStanzaId: String?,
+    ): XmppDirectMessage? {
+        val base =
+            DirectMessageBase(
+                idPrefix = peerJid,
+                createdAt = createdAt,
+                serverId = serverId,
+                originStanzaId = originStanzaId,
+                peerJid = peerJid,
+                fromJid = fromBare,
+                senderName = directSenderName(fromBare, ownBareJid, peerJid),
+            )
+        message.displayedTargetId()?.let { return base.displayed(it) }
+        message.chatState()?.let { return base.chatState(it) }
+        message.reactionUpdate()?.let { return base.reaction(it) }
+        message.retractionTargetId()?.let { return base.retraction(it) }
+        return null
+    }
+
+    private inner class RoomMessageBase(
+        private val idPrefix: String,
+        private val createdAt: String,
+        private val serverId: String?,
+        private val originStanzaId: String?,
+        private val roomJid: String,
+        private val senderId: String?,
+        private val senderName: String?,
+    ) {
+        fun displayed(displayedId: String): XmppHistoryMessage = message(displayedId = displayedId, idFallback = "displayed:$displayedId")
+
+        fun chatState(chatState: ChatState): XmppHistoryMessage = message(chatState = chatState, idFallback = "chat-state:$chatState")
+
+        fun reaction(reaction: ReactionUpdate): XmppHistoryMessage =
+            message(
+                reactionTargetId = reaction.targetId,
+                reactionEmojis = reaction.emojis,
+                idFallback = "reaction:${reaction.targetId}",
+            )
+
+        fun retraction(retractsId: String): XmppHistoryMessage = message(retractsId = retractsId, idFallback = "retract:$retractsId")
+
+        private fun message(
+            idFallback: String,
+            displayedId: String? = null,
+            chatState: ChatState? = null,
+            reactionTargetId: String? = null,
+            reactionEmojis: List<String> = emptyList(),
+            retractsId: String? = null,
+        ): XmppHistoryMessage =
+            XmppHistoryMessage(
+                id = serverId ?: fallbackMessageId(idPrefix, createdAt, idFallback),
+                serverId = serverId,
+                originStanzaId = originStanzaId,
+                roomJid = roomJid,
+                senderId = senderId,
+                senderName = senderName,
+                body = "",
+                createdAt = createdAt,
+                displayedId = displayedId,
+                chatState = chatState,
+                reactionTargetId = reactionTargetId,
+                reactionEmojis = reactionEmojis,
+                retractsId = retractsId,
+            )
+    }
+
+    private inner class DirectMessageBase(
+        private val idPrefix: String,
+        private val createdAt: String,
+        private val serverId: String?,
+        private val originStanzaId: String?,
+        private val peerJid: String,
+        private val fromJid: String,
+        private val senderName: String,
+    ) {
+        fun displayed(displayedId: String): XmppDirectMessage = message(displayedId = displayedId, idFallback = "dm-displayed:$displayedId")
+
+        fun chatState(chatState: ChatState): XmppDirectMessage = message(chatState = chatState, idFallback = "dm-chat-state:$chatState")
+
+        fun reaction(reaction: ReactionUpdate): XmppDirectMessage =
+            message(
+                reactionTargetId = reaction.targetId,
+                reactionEmojis = reaction.emojis,
+                idFallback = "dm-reaction:${reaction.targetId}",
+            )
+
+        fun retraction(retractsId: String): XmppDirectMessage = message(retractsId = retractsId, idFallback = "dm-retract:$retractsId")
+
+        private fun message(
+            idFallback: String,
+            displayedId: String? = null,
+            chatState: ChatState? = null,
+            reactionTargetId: String? = null,
+            reactionEmojis: List<String> = emptyList(),
+            retractsId: String? = null,
+        ): XmppDirectMessage =
+            XmppDirectMessage(
+                id = serverId ?: fallbackMessageId(idPrefix, createdAt, idFallback),
+                serverId = serverId,
+                originStanzaId = originStanzaId,
+                peerJid = peerJid,
+                fromJid = fromJid,
+                senderName = senderName,
+                body = "",
+                createdAt = createdAt,
+                displayedId = displayedId,
+                chatState = chatState,
+                reactionTargetId = reactionTargetId,
+                reactionEmojis = reactionEmojis,
+                retractsId = retractsId,
+            )
     }
 
     private data class ReactionUpdate(
@@ -336,6 +420,7 @@ internal class XmppMessageMapper(
             element
                 .getElements("reaction")
                 .mapNotNull { it.text?.takeIf(String::isNotBlank) }
+                .distinct()
         return ReactionUpdate(targetId = targetId, emojis = emojis)
     }
 
@@ -412,6 +497,137 @@ internal class XmppMessageMapper(
 
     private fun Message.isSticker(): Boolean = getExtensionElement("sticker", STICKERS_NAMESPACE) != null
 
+    /**
+     * XEP-0201 `<thread>body</thread>` — Smack parses the `<thread>` element
+     * into `Message.getThread()` directly, not as a StandardExtensionElement,
+     * so we go through the built-in property.
+     */
+    private fun Message.threadId(): String? = thread?.takeIf { it.isNotBlank() }
+
+    /** XEP-0508 `<thread-create xmlns='urn:xmpp:forums:0' title='…'/>`. */
+    private fun Message.forumTopicTitle(): String? =
+        (getExtensionElement("thread-create", FORUMS_NAMESPACE) as? StandardExtensionElement)
+            ?.getAttributeValue("title")
+            ?.takeIf { it.isNotBlank() }
+
+    /** XEP-0508 `<thread-reply xmlns='urn:xmpp:forums:0' thread-id='…'/>`. */
+    private fun Message.forumReplyThreadId(): String? =
+        (getExtensionElement("thread-reply", FORUMS_NAMESPACE) as? StandardExtensionElement)
+            ?.getAttributeValue("thread-id")
+            ?.takeIf { it.isNotBlank() }
+
+    /**
+     * XEP-0394 Message Markup: parses `<markup xmlns='urn:xmpp:markup:0'>` with
+     * child elements like `<span start='0' end='5'><bold/></span>` or
+     * semantic tags (`<code>`, `<bquote>`, `<link url='…'>`).
+     */
+    private fun Message.markupRanges(): List<XmppMarkupRange> {
+        val messageBody = body ?: return emptyList()
+        val markup = (getExtensionElement("markup", MARKUP_NAMESPACE) as? StandardExtensionElement) ?: return emptyList()
+        return markup.elements.mapNotNull { child -> parseMarkupChild(child, messageBody) }
+    }
+
+    private fun parseMarkupChild(
+        child: StandardExtensionElement,
+        messageBody: String,
+    ): XmppMarkupRange? {
+        val start = child.getAttributeValue("start")?.toIntOrNull() ?: return null
+        val end = child.getAttributeValue("end")?.toIntOrNull() ?: return null
+        if (end <= start) return null
+        val style = markupStyleFor(child) ?: return null
+        val range = messageBody.xmppCodePointRangeToUtf16(start, end) ?: return null
+        return XmppMarkupRange(start = range.first, end = range.second, style = style)
+    }
+
+    private fun markupStyleFor(child: StandardExtensionElement): XmppMarkupStyle? {
+        tagToStyle(child.elementName)?.let { return it }
+        if (child.elementName == "span") {
+            val inner = child.elements.firstOrNull() ?: return null
+            return tagToStyle(inner.elementName)
+        }
+        return null
+    }
+
+    private fun tagToStyle(tag: String): XmppMarkupStyle? =
+        when (tag) {
+            "strong" -> XmppMarkupStyle.BOLD
+            "bold" -> XmppMarkupStyle.BOLD
+            "emphasis" -> XmppMarkupStyle.ITALIC
+            "italic" -> XmppMarkupStyle.ITALIC
+            "deleted" -> XmppMarkupStyle.STRIKE
+            "strike" -> XmppMarkupStyle.STRIKE
+            "code" -> XmppMarkupStyle.CODE
+            "bcode" -> XmppMarkupStyle.CODE
+            "bquote" -> XmppMarkupStyle.BLOCKQUOTE
+            "link" -> XmppMarkupStyle.LINK
+            else -> null
+        }
+
+    /**
+     * Parse XEP-0317 hats. Accepts both wire shapes:
+     *   `<hats xmlns='urn:xmpp:hats:0'><hat uri='…' title='…'/></hats>` (standard)
+     *   `<hat xmlns='urn:xmpp:hats:0' uri='…' title='…'/>` (chat-frontend shorthand)
+     */
+    private fun Message.hats(): List<WaddleHat> {
+        val wrapped = standardExtension("hats", HATS_NAMESPACE)
+        if (wrapped != null) {
+            return wrapped.getElements("hat").mapNotNull(::parseHat)
+        }
+        return getExtensions("hat", HATS_NAMESPACE)
+            .mapNotNull { it as? StandardExtensionElement }
+            .mapNotNull(::parseHat)
+    }
+
+    private fun parseHat(element: StandardExtensionElement): WaddleHat? {
+        val uri = element.getAttributeValue("uri")?.takeIf { it.isNotBlank() } ?: return null
+        val title = element.getAttributeValue("title")?.takeIf { it.isNotBlank() } ?: uri.substringAfterLast(':')
+        return WaddleHat(uri = uri, title = title)
+    }
+
+    /**
+     * XEP-0428 Fallback Indication: when the message carries a
+     * `<fallback for="urn:xmpp:reply:0">` element with a `<body start end/>`
+     * range, that range of the body is quoted-preamble for legacy clients.
+     * We're reply-aware (we render a `<reply/>` chip), so we strip that
+     * range — per the XEP — and display only the new reply text.
+     */
+    private fun String.stripFallbacks(
+        message: Message,
+        vararg namespaces: String,
+    ): String {
+        val ranges =
+            namespaces
+                .flatMap { namespace -> message.fallbackBodyRanges(namespace, this) }
+                .distinct()
+                .sortedByDescending { it.first }
+        if (ranges.isEmpty()) return this
+        return ranges
+            .fold(this) { current, range ->
+                current.removeRange(range.first, range.second.coerceAtMost(current.length))
+            }.trim()
+    }
+
+    private fun Message.fallbackBodyRanges(
+        namespace: String,
+        messageBody: String,
+    ): List<Pair<Int, Int>> =
+        getExtensions("fallback", FALLBACK_NAMESPACE)
+            .mapNotNull { it as? StandardExtensionElement }
+            .filter { it.getAttributeValue("for") == namespace }
+            .flatMap { fallback ->
+                val bodyRanges = fallback.getElements("body")
+                if (bodyRanges.isEmpty()) {
+                    listOf(0 to messageBody.length)
+                } else {
+                    bodyRanges.mapNotNull { bodyRange ->
+                        val bodyCodePointLength = messageBody.codePointCount(0, messageBody.length)
+                        val start = bodyRange.getAttributeValue("start")?.toIntOrNull()?.coerceIn(0, bodyCodePointLength) ?: 0
+                        val end = bodyRange.getAttributeValue("end")?.toIntOrNull()?.coerceIn(0, bodyCodePointLength) ?: bodyCodePointLength
+                        messageBody.xmppCodePointRangeToUtf16(start, end)
+                    }
+                }
+            }
+
     private fun Message.callInvite(fallbackId: String): XmppCallInvite? {
         val invite = standardExtension("invite", CALL_INVITES_NAMESPACE) ?: return null
         val meeting = standardExtension("meeting", ONLINE_MEETINGS_NAMESPACE)
@@ -440,27 +656,38 @@ internal class XmppMessageMapper(
         namespace: String,
     ): StandardExtensionElement? = getExtensionElement(element, namespace) as? StandardExtensionElement
 
-    private fun stableMessageId(
-        result: MamElements.MamResultExtension,
+    private fun roomStableMessageId(
         message: Message,
+        roomJid: String,
     ): String? =
         message
             .getExtensions(StanzaIdElement::class.java)
-            .firstOrNull()
+            .firstOrNull { stanzaId -> stanzaId.by.toString().bareJid() == roomJid.bareJid() }
             ?.id
             .nonBlank()
-            ?: result.id.nonBlank()
-            ?: message.stanzaId.nonBlank()
 
-    private fun liveMessageId(message: Message): String? {
-        val stableId =
-            message
-                .getExtensions(StanzaIdElement::class.java)
-                .firstOrNull()
-                ?.id
-                .nonBlank()
-        return stableId ?: message.stanzaId.nonBlank()
-    }
+    private fun directStableMessageId(
+        message: Message,
+        trustedBareJids: Set<String>,
+    ): String? =
+        message
+            .getExtensions(StanzaIdElement::class.java)
+            .firstOrNull { stanzaId -> stanzaId.by.toString().bareJid() in trustedBareJids }
+            ?.id
+            .nonBlank()
+
+    private fun trustedDirectStanzaIdAssigners(
+        message: Message,
+        ownBareJid: String,
+        peerJid: String,
+    ): Set<String> =
+        listOf(
+            ownBareJid,
+            peerJid,
+            message.from?.toString()?.bareJid(),
+            message.to?.toString()?.bareJid(),
+        ).mapNotNull { it?.takeIf(String::isNotBlank) }
+            .toSet()
 
     private fun Message.historySenderName(): String? {
         val fromValue = from?.toString() ?: return null
@@ -516,13 +743,29 @@ internal class XmppMessageMapper(
 
     private fun String.bareJid(): String = substringBefore('/')
 
+    private fun String.xmppCodePointRangeToUtf16(
+        start: Int,
+        end: Int,
+    ): Pair<Int, Int>? {
+        if (end <= start) return null
+        val codePointLength = codePointCount(0, length)
+        val safeStart = start.coerceIn(0, codePointLength)
+        val safeEnd = end.coerceIn(safeStart, codePointLength)
+        return offsetByCodePoints(0, safeStart) to offsetByCodePoints(0, safeEnd)
+    }
+
     private companion object {
         const val CALL_INVITES_NAMESPACE = "urn:xmpp:call-invites:0"
         const val CHAT_MARKERS_NAMESPACE = "urn:xmpp:chat-markers:0"
         const val CHAT_STATES_NAMESPACE = "http://jabber.org/protocol/chatstates"
         const val CORRECTION_NAMESPACE = "urn:xmpp:message-correct:0"
         const val EXPLICIT_MENTIONS_NAMESPACE = "urn:xmpp:emn:0"
+        const val FALLBACK_NAMESPACE = "urn:xmpp:fallback:0"
         const val FASTEN_NAMESPACE = "urn:xmpp:fasten:0"
+        const val FORUMS_NAMESPACE = "urn:xmpp:forums:0"
+        const val HATS_NAMESPACE = "urn:xmpp:hats:0"
+        const val MARKUP_NAMESPACE = "urn:xmpp:markup:0"
+        const val ORIGIN_ID_NAMESPACE = "urn:xmpp:sid:0"
         const val FILE_METADATA_NAMESPACE = "urn:xmpp:file:metadata:0"
         const val FILE_SHARING_NAMESPACE = "urn:xmpp:sfs:0"
         const val MESSAGE_MODERATE_NAMESPACE = "urn:xmpp:message-moderate:0"

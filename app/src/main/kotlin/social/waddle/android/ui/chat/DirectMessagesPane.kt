@@ -27,6 +27,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.Reply
 import androidx.compose.material.icons.automirrored.rounded.Send
 import androidx.compose.material.icons.rounded.AttachFile
 import androidx.compose.material.icons.rounded.Close
@@ -47,6 +48,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -76,6 +78,7 @@ fun DirectMessagesPane(
     reactions: List<ReactionSummary>,
     displayedSummaries: List<DeliverySummary>,
     typingByPeer: Map<String, Boolean>,
+    replyPreview: ReplyPreview?,
     onSearchUsers: (String) -> Unit,
     onSelectPeer: (String) -> Unit,
     onClearPeer: () -> Unit,
@@ -86,6 +89,8 @@ fun DirectMessagesPane(
     onEdit: (String, String) -> Unit,
     onReact: (String, String) -> Unit,
     onRetract: (String) -> Unit,
+    onStartReply: (DmMessageEntity) -> Unit,
+    onClearReply: () -> Unit,
     onAttachmentPicked: (Uri, String?, String?) -> Unit = { _, _, _ -> },
 ) {
     val compact = LocalConfiguration.current.orientation == Configuration.ORIENTATION_PORTRAIT
@@ -98,6 +103,7 @@ fun DirectMessagesPane(
             reactions = reactions,
             displayedSummaries = displayedSummaries,
             typingByPeer = typingByPeer,
+            replyPreview = replyPreview,
             onSearchUsers = onSearchUsers,
             onSelectPeer = onSelectPeer,
             onClearPeer = onClearPeer,
@@ -108,6 +114,8 @@ fun DirectMessagesPane(
             onEdit = onEdit,
             onReact = onReact,
             onRetract = onRetract,
+            onStartReply = onStartReply,
+            onClearReply = onClearReply,
             onAttachmentPicked = onAttachmentPicked,
         )
         return
@@ -141,12 +149,15 @@ fun DirectMessagesPane(
                 onEdit = onEdit,
                 onReact = onReact,
                 onRetract = onRetract,
+                onStartReply = onStartReply,
             )
             DirectMessageComposer(
                 enabled = state.selectedDmPeerJid != null && !state.sending,
                 sending = state.sending,
+                replyPreview = replyPreview,
                 onTyping = onTyping,
                 onSend = onSend,
+                onClearReply = onClearReply,
                 onAttachmentPicked = onAttachmentPicked,
             )
         }
@@ -162,6 +173,7 @@ private fun CompactDirectMessagesPane(
     reactions: List<ReactionSummary>,
     displayedSummaries: List<DeliverySummary>,
     typingByPeer: Map<String, Boolean>,
+    replyPreview: ReplyPreview?,
     onSearchUsers: (String) -> Unit,
     onSelectPeer: (String) -> Unit,
     onClearPeer: () -> Unit,
@@ -172,6 +184,8 @@ private fun CompactDirectMessagesPane(
     onEdit: (String, String) -> Unit,
     onReact: (String, String) -> Unit,
     onRetract: (String) -> Unit,
+    onStartReply: (DmMessageEntity) -> Unit,
+    onClearReply: () -> Unit,
     onAttachmentPicked: (Uri, String?, String?) -> Unit = { _, _, _ -> },
 ) {
     if (state.selectedDmPeerJid == null) {
@@ -202,12 +216,15 @@ private fun CompactDirectMessagesPane(
             onEdit = onEdit,
             onReact = onReact,
             onRetract = onRetract,
+            onStartReply = onStartReply,
         )
         DirectMessageComposer(
             enabled = !state.sending,
             sending = state.sending,
+            replyPreview = replyPreview,
             onTyping = onTyping,
             onSend = onSend,
+            onClearReply = onClearReply,
             onAttachmentPicked = onAttachmentPicked,
         )
     }
@@ -375,9 +392,20 @@ private fun DirectMessageTimeline(
     onEdit: (String, String) -> Unit,
     onReact: (String, String) -> Unit,
     onRetract: (String) -> Unit,
+    onStartReply: (DmMessageEntity) -> Unit,
 ) {
     val listState = rememberLazyListState()
     val latestReadable = messages.lastOrNull { it.fromJid != session.jid && !it.retracted }
+    val parentLookup =
+        remember(messages) {
+            buildMap {
+                for (message in messages) {
+                    put(message.id, message)
+                    message.serverId?.let { put(it, message) }
+                    message.originStanzaId?.let { put(it, message) }
+                }
+            }
+        }
     LaunchedEffect(messages.lastOrNull()?.id) {
         if (messages.isNotEmpty()) {
             listState.animateScrollToItem(messages.lastIndex)
@@ -404,18 +432,23 @@ private fun DirectMessageTimeline(
         }
         items(messages, key = DmMessageEntity::id) { message ->
             val messageReactions =
-                reactionsByMessageId[message.id].orEmpty() + reactionsByMessageId[message.serverId].orEmpty()
+                reactionsByMessageId[message.id].orEmpty() +
+                    reactionsByMessageId[message.serverId].orEmpty() +
+                    reactionsByMessageId[message.originStanzaId].orEmpty()
             DirectMessageRow(
                 message = message,
+                parentMessage = message.replyToMessageId?.let(parentLookup::get),
                 own = message.fromJid == session.jid,
                 reactions = messageReactions.distinctBy { it.emoji },
                 displayedCount =
                     displayedByMessageId[message.id]?.count
                         ?: message.serverId?.let { displayedByMessageId[it]?.count }
+                        ?: message.originStanzaId?.let { displayedByMessageId[it]?.count }
                         ?: 0,
                 onEdit = { body -> onEdit(message.messageKey, body) },
                 onReact = { emoji -> onReact(message.messageKey, emoji) },
                 onRetract = { onRetract(message.messageKey) },
+                onStartReply = { onStartReply(message) },
             )
         }
         if (messages.isEmpty()) {
@@ -427,12 +460,14 @@ private fun DirectMessageTimeline(
 @Composable
 private fun DirectMessageRow(
     message: DmMessageEntity,
+    parentMessage: DmMessageEntity?,
     own: Boolean,
     reactions: List<ReactionSummary>,
     displayedCount: Int,
     onEdit: (String) -> Unit,
     onReact: (String) -> Unit,
     onRetract: () -> Unit,
+    onStartReply: () -> Unit,
 ) {
     var editing by rememberSaveable(message.id) { mutableStateOf(false) }
     var editBody by rememberSaveable(message.id) { mutableStateOf(message.body) }
@@ -505,6 +540,9 @@ private fun DirectMessageRow(
                     },
                 )
             } else {
+                message.replyToMessageId?.let {
+                    DirectInlineReply(parentMessage = parentMessage)
+                }
                 Text(text = message.body, style = MaterialTheme.typography.bodyLarge)
                 DirectMessageExtras(message = message)
                 DirectReactionStrip(reactions = reactions, onReact = onReact)
@@ -514,8 +552,35 @@ private fun DirectMessageRow(
                     onStartEdit = { editing = true },
                     onReact = onReact,
                     onRetract = onRetract,
+                    onStartReply = onStartReply,
                 )
             }
+        }
+    }
+}
+
+@Composable
+private fun DirectInlineReply(parentMessage: DmMessageEntity?) {
+    Surface(
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+        shape = RoundedCornerShape(8.dp),
+        modifier = Modifier.padding(bottom = 6.dp),
+    ) {
+        Column(Modifier.padding(horizontal = 10.dp, vertical = 6.dp)) {
+            Text(
+                text = parentMessage?.senderName ?: "Earlier message",
+                style = MaterialTheme.typography.labelMedium,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                text = parentMessage?.body?.takeIf { it.isNotBlank() } ?: "Replying to earlier message",
+                style = MaterialTheme.typography.bodySmall,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
         }
     }
 }
@@ -621,6 +686,7 @@ private fun DirectMessageActionRow(
     onStartEdit: () -> Unit,
     onReact: (String) -> Unit,
     onRetract: () -> Unit,
+    onStartReply: () -> Unit,
 ) {
     Row(
         modifier = Modifier.padding(top = 6.dp),
@@ -637,6 +703,9 @@ private fun DirectMessageActionRow(
             }
         }
         Spacer(Modifier.weight(1f))
+        IconButton(onClick = onStartReply, enabled = !pending) {
+            Icon(Icons.AutoMirrored.Rounded.Reply, contentDescription = "Reply")
+        }
         if (own) {
             IconButton(onClick = onStartEdit, enabled = !pending) {
                 Icon(Icons.Rounded.Edit, contentDescription = "Edit message")
@@ -675,17 +744,19 @@ private fun formatDmStamp(value: String): String =
     }.getOrElse { "" }
 
 private val DM_STAMP_FORMATTER: DateTimeFormatter = DateTimeFormatter.ofPattern("HH:mm")
-private val DIRECT_QUICK_REACTIONS = listOf("+1", "❤️", "😂", "🎉", "👀")
+private val DIRECT_QUICK_REACTIONS = listOf("👍", "❤️", "😂", "🎉", "👀")
 
 private val DmMessageEntity.messageKey: String
-    get() = serverId ?: id
+    get() = originStanzaId ?: id
 
 @Composable
 private fun DirectMessageComposer(
     enabled: Boolean,
     sending: Boolean,
+    replyPreview: ReplyPreview?,
     onTyping: (Boolean) -> Unit,
     onSend: (String) -> Unit,
+    onClearReply: () -> Unit,
     onAttachmentPicked: (Uri, String?, String?) -> Unit,
 ) {
     var body by rememberSaveable { mutableStateOf("") }
@@ -698,50 +769,94 @@ private fun DirectMessageComposer(
                 onAttachmentPicked(attachment.uri, attachment.name, attachment.mimeType)
             }
         }
-    Row(
+    Column(Modifier.fillMaxWidth()) {
+        replyPreview?.let { DirectReplyPreviewCard(preview = it, onClose = onClearReply) }
+        Row(
+            modifier =
+                Modifier
+                    .fillMaxWidth()
+                    .padding(12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            OutlinedTextField(
+                value = body,
+                onValueChange = { next ->
+                    body = next
+                    val nextComposing = next.isNotBlank()
+                    if (nextComposing != composing) {
+                        composing = nextComposing
+                        onTyping(nextComposing)
+                    }
+                },
+                enabled = enabled,
+                modifier = Modifier.weight(1f),
+                placeholder = { Text("Message") },
+                maxLines = 5,
+            )
+            IconButton(
+                onClick = { attachmentLauncher.launch(arrayOf("*/*")) },
+                enabled = enabled && !sending,
+            ) {
+                Icon(Icons.Rounded.AttachFile, contentDescription = "Attach file")
+            }
+            IconButton(
+                onClick = {
+                    val trimmed = body.trim()
+                    if (trimmed.isNotEmpty()) {
+                        onSend(trimmed)
+                        body = ""
+                        if (composing) {
+                            composing = false
+                            onTyping(false)
+                        }
+                    }
+                },
+                enabled = enabled && !sending && body.isNotBlank(),
+            ) {
+                Icon(Icons.AutoMirrored.Rounded.Send, contentDescription = "Send")
+            }
+        }
+    }
+}
+
+@Composable
+private fun DirectReplyPreviewCard(
+    preview: ReplyPreview,
+    onClose: () -> Unit,
+) {
+    Surface(
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+        shape = RoundedCornerShape(8.dp),
         modifier =
             Modifier
                 .fillMaxWidth()
-                .padding(12.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                .padding(horizontal = 12.dp, vertical = 4.dp),
     ) {
-        OutlinedTextField(
-            value = body,
-            onValueChange = { next ->
-                body = next
-                val nextComposing = next.isNotBlank()
-                if (nextComposing != composing) {
-                    composing = nextComposing
-                    onTyping(nextComposing)
-                }
-            },
-            enabled = enabled,
-            modifier = Modifier.weight(1f),
-            placeholder = { Text("Message") },
-            maxLines = 5,
-        )
-        IconButton(
-            onClick = { attachmentLauncher.launch(arrayOf("*/*")) },
-            enabled = enabled && !sending,
+        Row(
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
         ) {
-            Icon(Icons.Rounded.AttachFile, contentDescription = "Attach file")
-        }
-        IconButton(
-            onClick = {
-                val trimmed = body.trim()
-                if (trimmed.isNotEmpty()) {
-                    onSend(trimmed)
-                    body = ""
-                    if (composing) {
-                        composing = false
-                        onTyping(false)
-                    }
-                }
-            },
-            enabled = enabled && !sending && body.isNotBlank(),
-        ) {
-            Icon(Icons.AutoMirrored.Rounded.Send, contentDescription = "Send")
+            Column(Modifier.weight(1f)) {
+                Text(
+                    text = "Replying to ${preview.senderName}",
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    text = preview.body,
+                    style = MaterialTheme.typography.bodySmall,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            IconButton(onClick = onClose) {
+                Icon(Icons.Rounded.Close, contentDescription = "Cancel reply")
+            }
         }
     }
 }

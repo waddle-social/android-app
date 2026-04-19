@@ -3,6 +3,18 @@ package social.waddle.android.xmpp
 import org.jivesoftware.smack.packet.StandardExtensionElement
 
 object XmppExtensions {
+    /**
+     * XEP-0359 `<origin-id id="UUID" xmlns="urn:xmpp:sid:0"/>`. Lets us
+     * carry the sender-chosen stanza id as an explicit extension, so
+     * even if a MUC rewrites the `<message id=…>` attribute, peers can
+     * still recover the original id for reply / thread cross-references.
+     */
+    fun originId(id: String): StandardExtensionElement =
+        StandardExtensionElement
+            .builder("origin-id", "urn:xmpp:sid:0")
+            .addAttribute("id", id)
+            .build()
+
     fun markable(): StandardExtensionElement = StandardExtensionElement.builder("markable", "urn:xmpp:chat-markers:0").build()
 
     fun storeHint(): StandardExtensionElement = StandardExtensionElement.builder("store", "urn:xmpp:hints").build()
@@ -54,11 +66,33 @@ object XmppExtensions {
         return builder.build()
     }
 
-    fun reply(messageId: String): StandardExtensionElement =
+    fun reply(
+        messageId: String,
+        toJid: String? = null,
+    ): StandardExtensionElement {
+        val builder =
+            StandardExtensionElement
+                .builder("reply", "urn:xmpp:reply:0")
+                .addAttribute("id", messageId)
+        toJid?.takeIf(String::isNotBlank)?.let { builder.addAttribute("to", it) }
+        return builder.build()
+    }
+
+    fun fallback(
+        forNamespace: String,
+        start: Int,
+        end: Int,
+    ): StandardExtensionElement =
         StandardExtensionElement
-            .builder("reply", "urn:xmpp:reply:0")
-            .addAttribute("id", messageId)
-            .build()
+            .builder("fallback", "urn:xmpp:fallback:0")
+            .addAttribute("for", forNamespace)
+            .addElement(
+                StandardExtensionElement
+                    .builder("body", "urn:xmpp:fallback:0")
+                    .addAttribute("start", start.toString())
+                    .addAttribute("end", end.toString())
+                    .build(),
+            ).build()
 
     fun retract(messageId: String): StandardExtensionElement =
         StandardExtensionElement
@@ -72,7 +106,11 @@ object XmppExtensions {
     ): StandardExtensionElement {
         val builder = StandardExtensionElement.builder("reactions", "urn:xmpp:reactions:0")
         builder.addAttribute("id", messageId)
-        emojis.forEach { emoji -> builder.addElement("reaction", emoji) }
+        emojis
+            .map(String::trim)
+            .filter(String::isNotBlank)
+            .distinct()
+            .forEach { emoji -> builder.addElement("reaction", emoji) }
         return builder.build()
     }
 
@@ -104,6 +142,40 @@ object XmppExtensions {
             .addElement(fileBuilder.build())
             .addElement(sources)
             .build()
+    }
+
+    /** XEP-0508 Forums: `<thread-create xmlns='urn:xmpp:forums:0' title='…'/>`. */
+    fun forumThreadCreate(title: String): StandardExtensionElement =
+        StandardExtensionElement
+            .builder("thread-create", "urn:xmpp:forums:0")
+            .addAttribute("title", title)
+            .build()
+
+    /** XEP-0508 Forums: `<thread-reply xmlns='urn:xmpp:forums:0' thread-id='…'/>`. */
+    fun forumThreadReply(threadId: String): StandardExtensionElement =
+        StandardExtensionElement
+            .builder("thread-reply", "urn:xmpp:forums:0")
+            .addAttribute("thread-id", threadId)
+            .build()
+
+    /** XEP-0449 Stickers: `<sticker xmlns='urn:xmpp:stickers:0' pack='…'/>`. */
+    fun sticker(pack: String?): StandardExtensionElement {
+        val builder = StandardExtensionElement.builder("sticker", "urn:xmpp:stickers:0")
+        pack?.takeIf(String::isNotBlank)?.let { builder.addAttribute("pack", it) }
+        return builder.build()
+    }
+
+    /** XEP-0201 Message Thread: `<thread parent='…'>ID</thread>` (parent optional). */
+    fun thread(
+        threadId: String,
+        parentThreadId: String? = null,
+    ): StandardExtensionElement {
+        val builder =
+            StandardExtensionElement
+                .builder("thread", "jabber:client")
+                .setText(threadId)
+        parentThreadId?.takeIf(String::isNotBlank)?.let { builder.addAttribute("parent", it) }
+        return builder.build()
     }
 
     fun callInvite(

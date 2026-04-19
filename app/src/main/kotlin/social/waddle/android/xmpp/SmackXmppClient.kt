@@ -1,12 +1,10 @@
 package social.waddle.android.xmpp
 
-import android.annotation.SuppressLint
 import android.content.Context
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
-import android.provider.Settings
 import androidx.core.content.getSystemService
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CompletableDeferred
@@ -43,16 +41,22 @@ import org.jivesoftware.smack.c2s.ModularXmppClientToServerConnectionConfigurati
 import org.jivesoftware.smack.filter.StanzaFilter
 import org.jivesoftware.smack.packet.IQ
 import org.jivesoftware.smack.packet.Message
+import org.jivesoftware.smack.packet.MessageBuilder
 import org.jivesoftware.smack.packet.Presence
+import org.jivesoftware.smack.packet.StandardExtensionElement
 import org.jivesoftware.smack.packet.Stanza
 import org.jivesoftware.smack.packet.StanzaBuilder
+import org.jivesoftware.smack.packet.XmlElement
 import org.jivesoftware.smack.provider.ProviderManager
+import org.jivesoftware.smack.sm.StreamManagementModule
+import org.jivesoftware.smack.sm.StreamManagementModuleDescriptor
 import org.jivesoftware.smack.tcp.XMPPTCPConnection
 import org.jivesoftware.smack.tcp.XMPPTCPConnectionConfiguration
 import org.jivesoftware.smack.util.StringUtils
 import org.jivesoftware.smack.websocket.XmppWebSocketTransportModuleDescriptor
 import org.jivesoftware.smack.websocket.okhttp.OkHttpWebSocketFactory
 import org.jivesoftware.smackx.carbons.CarbonManager
+import org.jivesoftware.smackx.carbons.packet.CarbonExtension
 import org.jivesoftware.smackx.disco.ServiceDiscoveryManager
 import org.jivesoftware.smackx.httpfileupload.HttpFileUploadManager
 import org.jivesoftware.smackx.mam.element.MamElements
@@ -92,6 +96,8 @@ class SmackXmppClient
         private val mutableIncomingDirectMessages = MutableSharedFlow<XmppDirectMessage>(extraBufferCapacity = INCOMING_BUFFER_SIZE)
         private val mutableCallSignals = MutableSharedFlow<InboundCallSignal>(extraBufferCapacity = INCOMING_BUFFER_SIZE)
         private val mutablePresences = MutableStateFlow<Map<String, Boolean>>(emptyMap())
+        private val mutableActiveRoomJids = MutableStateFlow<Set<String>>(emptySet())
+        private val mutableRoomAvatarHashes = MutableStateFlow<Map<String, String>>(emptyMap())
 
         // Serialises connect()/disconnect() so the three callers that
         // bootstrap the session (ChatViewModel, WaddleMessagingService,
@@ -124,6 +130,14 @@ class SmackXmppClient
         override val callSignals: Flow<InboundCallSignal> = mutableCallSignals.asSharedFlow()
         override val supportedFeatures: List<XepFeature> = XmppFeatureRegistry.supported
         override val presences: StateFlow<Map<String, Boolean>> = mutablePresences.asStateFlow()
+        override val activeRoomJids: StateFlow<Set<String>> = mutableActiveRoomJids.asStateFlow()
+        override val roomAvatarHashes: StateFlow<Map<String, String>> = mutableRoomAvatarHashes.asStateFlow()
+
+        override fun clearRoomActivity(roomJid: String) {
+            mutableActiveRoomJids.update { current ->
+                if (roomJid in current) current - roomJid else current
+            }
+        }
 
         override suspend fun connect(
             session: StoredSession,
@@ -264,17 +278,26 @@ class SmackXmppClient
         ): List<XmppChannelRef> =
             withConnection { activeConnection ->
                 val domain = JidCreate.domainBareFrom("spaces.${session.xmppDomain}")
-                ServiceDiscoveryManager
-                    .getInstanceFor(activeConnection)
+                val discoManager = ServiceDiscoveryManager.getInstanceFor(activeConnection)
+                discoManager
                     .discoverItems(domain, waddleId)
                     .items
                     .map { item ->
                         val roomJid = item.entityID.toString()
                         val roomLocalpart = roomJid.substringBefore('@')
+                        // XEP-0030 disco#info per room so we can detect the
+                        // XEP-0508 `urn:xmpp:forums:0` feature and tag the
+                        // channel as a forum. Failures fall back to "text".
+                        val channelType =
+                            runCatching {
+                                val info = discoManager.discoverInfo(item.entityID)
+                                if (info.containsFeature(FORUMS_FEATURE)) "forum" else "text"
+                            }.getOrDefault("text")
                         XmppChannelRef(
                             id = roomLocalpart.removePrefix("${waddleId}_"),
                             name = item.name ?: roomLocalpart.removePrefix("${waddleId}_"),
                             roomJid = roomJid,
+                            channelType = channelType,
                         )
                     }
             }
@@ -283,30 +306,98 @@ class SmackXmppClient
             withConnection { activeConnection ->
                 ensureJoined(activeConnection, draft.roomJid)
                 val stanzaId = nextStanzaId()
-                val builder =
-                    StanzaBuilder
-                        .buildMessage(draft.stanzaId ?: stanzaId)
-                        .to(JidCreate.entityBareFrom(draft.roomJid))
-                        .ofType(Message.Type.groupchat)
-                        .setBody(draft.body)
-                        .addExtension(XmppExtensions.markable())
-                        .addExtension(XmppExtensions.storeHint())
-                DeliveryReceiptRequest.addTo(builder)
-                draft.replyToMessageId?.let { builder.addExtension(XmppExtensions.reply(it)) }
-                draft.correctionMessageId?.let { builder.addExtension(XmppExtensions.correction(it)) }
-                mentionReferences(draft.body, draft.mentions).forEach { mention ->
-                    builder.addExtension(XmppExtensions.referenceMention(mention.uri, mention.begin, mention.end))
-                }
-                explicitMentionTypes(draft.body).takeIf { it.isNotEmpty() }?.let { mentionTypes ->
-                    builder.addExtension(XmppExtensions.explicitMentions(mentionTypes))
-                }
-                draft.sharedFile?.let { sharedFile ->
-                    builder.addExtension(sharedFile.toFileSharingExtension())
-                }
-                val message = builder.build()
+                val wireId = draft.stanzaId ?: stanzaId
+                val message = buildGroupMessage(draft, wireId)
                 activeConnection.sendStanza(message)
                 message.stanzaId
             }
+
+        private fun buildGroupMessage(
+            draft: ChatMessageDraft,
+            wireId: String,
+        ): Message {
+            val preparedBody =
+                draft.replyToMessageId
+                    ?.let { bodyWithReplyFallback(draft.body, draft.replyToFallbackBody) }
+                    ?: PreparedBody(draft.body)
+            val builder =
+                StanzaBuilder
+                    .buildMessage(wireId)
+                    .to(JidCreate.entityBareFrom(draft.roomJid))
+                    .ofType(Message.Type.groupchat)
+                    .setBody(preparedBody.body)
+                    .addExtension(XmppExtensions.originId(wireId))
+                    .addExtension(XmppExtensions.markable())
+                    .addExtension(XmppExtensions.storeHint())
+            DeliveryReceiptRequest.addTo(builder)
+            addReplyExtensions(builder, draft, preparedBody)
+            addContentExtensions(builder, draft, preparedBody)
+            addThreadExtensions(builder, draft)
+            return builder.build()
+        }
+
+        private fun addReplyExtensions(
+            builder: MessageBuilder,
+            draft: ChatMessageDraft,
+            preparedBody: PreparedBody,
+        ) {
+            val replyId = draft.replyToMessageId ?: return
+            builder.addExtension(XmppExtensions.reply(replyId, draft.replyToSenderJid))
+            preparedBody.replyFallbackEnd?.let { end ->
+                builder.addExtension(XmppExtensions.fallback(REPLY_NAMESPACE, 0, end))
+            }
+        }
+
+        private fun addContentExtensions(
+            builder: MessageBuilder,
+            draft: ChatMessageDraft,
+            preparedBody: PreparedBody,
+        ) {
+            draft.correctionMessageId?.let { builder.addExtension(XmppExtensions.correction(it)) }
+            addMentionExtensions(builder, draft)
+            addSharedFileExtension(builder, draft.sharedFile, preparedBody)
+            draft.stickerPack?.let { pack -> builder.addExtension(XmppExtensions.sticker(pack)) }
+        }
+
+        private fun addMentionExtensions(
+            builder: MessageBuilder,
+            draft: ChatMessageDraft,
+        ) {
+            mentionReferences(draft.body, draft.mentions).forEach { mention ->
+                builder.addExtension(XmppExtensions.referenceMention(mention.uri, mention.begin, mention.end))
+            }
+            explicitMentionTypes(draft.body).takeIf { it.isNotEmpty() }?.let { mentionTypes ->
+                builder.addExtension(XmppExtensions.explicitMentions(mentionTypes))
+            }
+        }
+
+        private fun addSharedFileExtension(
+            builder: MessageBuilder,
+            sharedFile: ChatFileAttachment?,
+            preparedBody: PreparedBody,
+        ) {
+            sharedFile ?: return
+            builder.addExtension(sharedFile.toFileSharingExtension())
+            if (preparedBody.body.isBlank()) return
+            builder.addExtension(
+                XmppExtensions.fallback(
+                    FILE_SHARING_NAMESPACE,
+                    preparedBody.replyFallbackEnd ?: 0,
+                    preparedBody.body.xmppCodePointLength(),
+                ),
+            )
+        }
+
+        private fun addThreadExtensions(
+            builder: MessageBuilder,
+            draft: ChatMessageDraft,
+        ) {
+            draft.threadId?.let { tid ->
+                builder.addExtension(XmppExtensions.thread(threadId = tid, parentThreadId = draft.parentThreadId))
+            }
+            draft.forumTopicTitle?.let { title -> builder.addExtension(XmppExtensions.forumThreadCreate(title)) }
+            draft.forumReplyThreadId?.let { tid -> builder.addExtension(XmppExtensions.forumThreadReply(tid)) }
+        }
 
         override suspend fun loadMessageHistory(
             roomJid: String,
@@ -602,19 +693,44 @@ class SmackXmppClient
             body: String,
             stanzaId: String?,
             sharedFile: ChatFileAttachment?,
+            replyToMessageId: String?,
+            replyToSenderJid: String?,
+            replyToFallbackBody: String?,
         ): String =
             withConnection { activeConnection ->
                 val messageId = stanzaId ?: nextStanzaId()
+                val preparedBody =
+                    replyToMessageId
+                        ?.let { bodyWithReplyFallback(body, replyToFallbackBody) }
+                        ?: PreparedBody(body)
                 val builder =
                     StanzaBuilder
                         .buildMessage(messageId)
                         .to(JidCreate.entityBareFrom(peerJid))
                         .ofType(Message.Type.chat)
-                        .setBody(body)
+                        .setBody(preparedBody.body)
+                        .addExtension(XmppExtensions.originId(messageId))
                         .addExtension(XmppExtensions.markable())
                         .addExtension(XmppExtensions.storeHint())
                 DeliveryReceiptRequest.addTo(builder)
-                sharedFile?.let { builder.addExtension(it.toFileSharingExtension()) }
+                replyToMessageId?.let {
+                    builder.addExtension(XmppExtensions.reply(it, replyToSenderJid))
+                    preparedBody.replyFallbackEnd?.let { end ->
+                        builder.addExtension(XmppExtensions.fallback(REPLY_NAMESPACE, 0, end))
+                    }
+                }
+                sharedFile?.let {
+                    builder.addExtension(it.toFileSharingExtension())
+                    if (preparedBody.body.isNotBlank()) {
+                        builder.addExtension(
+                            XmppExtensions.fallback(
+                                FILE_SHARING_NAMESPACE,
+                                preparedBody.replyFallbackEnd ?: 0,
+                                preparedBody.body.xmppCodePointLength(),
+                            ),
+                        )
+                    }
+                }
                 val message = builder.build()
                 activeConnection.sendStanza(message)
                 message.stanzaId
@@ -662,7 +778,13 @@ class SmackXmppClient
             peerJid: String,
             messageId: String,
         ) {
-            sendDirectMarker(peerJid, XmppExtensions.retract(messageId), store = true)
+            sendDirectMarker(
+                peerJid = peerJid,
+                extension = XmppExtensions.retract(messageId),
+                store = true,
+                body = RETRACTION_FALLBACK_BODY,
+                fallbackForNamespace = RETRACTION_NAMESPACE,
+            )
         }
 
         override suspend fun reactDirect(
@@ -716,7 +838,13 @@ class SmackXmppClient
             roomJid: String,
             messageId: String,
         ) {
-            sendMarker(roomJid, XmppExtensions.retract(messageId), store = true)
+            sendMarker(
+                roomJid = roomJid,
+                extension = XmppExtensions.retract(messageId),
+                store = true,
+                body = RETRACTION_FALLBACK_BODY,
+                fallbackForNamespace = RETRACTION_NAMESPACE,
+            )
         }
 
         override suspend fun react(
@@ -1000,6 +1128,26 @@ class SmackXmppClient
                         (stanza.type == Message.Type.chat || stanza.type == Message.Type.groupchat)
                 },
             )
+
+            // ----- XEP-0502 MUC Activity Indicator -----
+            // Server pushes `<message><activity xmlns='urn:xmpp:muc-activity:0'><active jid='…'/></activity></message>`
+            // for rooms the user subscribes to but may not have joined — used
+            // for lightweight sidebar badges.
+            activeConnection.addAsyncStanzaListener(
+                StanzaListener { stanza ->
+                    val message = stanza as? Message ?: return@StanzaListener
+                    val activity =
+                        message.getExtensionElement("activity", MUC_ACTIVITY_NAMESPACE) as? StandardExtensionElement
+                            ?: return@StanzaListener
+                    val active = activity.getElements("active").mapNotNull { it.getAttributeValue("jid") }
+                    if (active.isEmpty()) return@StanzaListener
+                    mutableActiveRoomJids.update { current -> current + active }
+                },
+                StanzaFilter { stanza ->
+                    stanza is Message &&
+                        stanza.getExtensionElement("activity", MUC_ACTIVITY_NAMESPACE) != null
+                },
+            )
         }
 
         private fun buildIncomingJingleXml(iq: social.waddle.android.xmpp.call.JingleIQ): String {
@@ -1106,8 +1254,10 @@ class SmackXmppClient
 
         private suspend fun sendMarker(
             roomJid: String,
-            extension: org.jivesoftware.smack.packet.XmlElement,
+            extension: XmlElement,
             store: Boolean,
+            body: String? = null,
+            fallbackForNamespace: String? = null,
         ) {
             withConnection { activeConnection ->
                 ensureJoined(activeConnection, roomJid)
@@ -1117,6 +1267,12 @@ class SmackXmppClient
                         .to(JidCreate.entityBareFrom(roomJid))
                         .ofType(Message.Type.groupchat)
                         .addExtension(extension)
+                body?.takeIf(String::isNotBlank)?.let { fallbackBody ->
+                    builder.setBody(fallbackBody)
+                    fallbackForNamespace?.let {
+                        builder.addExtension(XmppExtensions.fallback(it, 0, fallbackBody.xmppCodePointLength()))
+                    }
+                }
                 builder.addExtension(if (store) XmppExtensions.storeHint() else XmppExtensions.noStoreHint())
                 activeConnection.sendStanza(builder.build())
             }
@@ -1124,8 +1280,10 @@ class SmackXmppClient
 
         private suspend fun sendDirectMarker(
             peerJid: String,
-            extension: org.jivesoftware.smack.packet.XmlElement,
+            extension: XmlElement,
             store: Boolean,
+            body: String? = null,
+            fallbackForNamespace: String? = null,
         ) {
             withConnection { activeConnection ->
                 val builder =
@@ -1134,6 +1292,12 @@ class SmackXmppClient
                         .to(JidCreate.entityBareFrom(peerJid))
                         .ofType(Message.Type.chat)
                         .addExtension(extension)
+                body?.takeIf(String::isNotBlank)?.let { fallbackBody ->
+                    builder.setBody(fallbackBody)
+                    fallbackForNamespace?.let {
+                        builder.addExtension(XmppExtensions.fallback(it, 0, fallbackBody.xmppCodePointLength()))
+                    }
+                }
                 builder.addExtension(if (store) XmppExtensions.storeHint() else XmppExtensions.noStoreHint())
                 activeConnection.sendStanza(builder.build())
             }
@@ -1159,6 +1323,7 @@ class SmackXmppClient
         }
 
         private fun configureConnection(activeConnection: AbstractXMPPConnection) {
+            advertiseDiscoFeatures(activeConnection)
             registerIncomingMessageListener(activeConnection)
             registerIncomingDirectMessageListener(activeConnection)
             registerPresenceListener(activeConnection)
@@ -1192,6 +1357,15 @@ class SmackXmppClient
                     }
                 },
             )
+        }
+
+        private fun advertiseDiscoFeatures(activeConnection: AbstractXMPPConnection) {
+            val discoManager = ServiceDiscoveryManager.getInstanceFor(activeConnection)
+            CLIENT_DISCO_FEATURES.forEach { feature ->
+                if (!discoManager.includesFeature(feature)) {
+                    discoManager.addFeature(feature)
+                }
+            }
         }
 
         private fun maybeScheduleReconnect(activeConnection: AbstractXMPPConnection) {
@@ -1350,6 +1524,23 @@ class SmackXmppClient
                     mutablePresences.update { current ->
                         if (current[bareJid] == available) current else current + (bareJid to available)
                     }
+                    // XEP-0486 MUC Avatars: rooms advertise their avatar hash via
+                    // the legacy vcard-temp:x:update payload on presence. Track the
+                    // latest hash so the UI can bust caches when it changes.
+                    if (available) {
+                        val vcardUpdate =
+                            presence.getExtensionElement("x", VCARD_UPDATE_NAMESPACE) as? StandardExtensionElement
+                        val photoHash =
+                            vcardUpdate
+                                ?.getFirstElement("photo", VCARD_UPDATE_NAMESPACE)
+                                ?.text
+                                ?.takeIf { it.isNotBlank() }
+                        if (photoHash != null) {
+                            mutableRoomAvatarHashes.update { current ->
+                                if (current[bareJid] == photoHash) current else current + (bareJid to photoHash)
+                            }
+                        }
+                    }
                 },
                 StanzaFilter { stanza -> stanza is Presence },
             )
@@ -1383,7 +1574,16 @@ class SmackXmppClient
                 StanzaListener { stanza ->
                     val message = stanza as? Message ?: return@StanzaListener
                     val ownBareJid = accountBareJid ?: return@StanzaListener
-                    liveDirectMessageFrom(message, ownBareJid)?.let { incoming ->
+                    val effectiveMessage =
+                        CarbonExtension
+                            .from(message)
+                            ?.forwarded
+                            ?.forwardedStanza
+                            ?: message
+                    if (effectiveMessage.type != Message.Type.chat || effectiveMessage.isKnownRoomPrivateMessage()) {
+                        return@StanzaListener
+                    }
+                    liveDirectMessageFrom(effectiveMessage, ownBareJid)?.let { incoming ->
                         if (!mutableIncomingDirectMessages.tryEmit(incoming)) {
                             WaddleLog.info("Dropped incoming direct XMPP message because the buffer is full.")
                         } else {
@@ -1391,8 +1591,17 @@ class SmackXmppClient
                         }
                     }
                 },
-                StanzaFilter { stanza -> stanza is Message && stanza.type == Message.Type.chat },
+                StanzaFilter { stanza ->
+                    stanza is Message && (stanza.type == Message.Type.chat || CarbonExtension.from(stanza) != null)
+                },
             )
+        }
+
+        private fun Message.isKnownRoomPrivateMessage(): Boolean {
+            val fromBare = from?.toString()?.bareJid()
+            val toBare = to?.toString()?.bareJid()
+            return (fromBare != null && joinedRoomJids.contains(fromBare)) ||
+                (toBare != null && joinedRoomJids.contains(toBare))
         }
 
         private fun rejoinRooms(activeConnection: AbstractXMPPConnection) {
@@ -1483,6 +1692,7 @@ class SmackXmppClient
                     .addEnabledSaslMechanism(OAuthBearerMechanism.NAME)
                     .setSecurityMode(securityMode(environment))
                     .setSendPresence(true)
+                    .addModule(StreamManagementModuleDescriptor::class.java)
             if (BuildConfig.DEBUG) {
                 builder.enableDefaultDebugger()
             }
@@ -1491,7 +1701,11 @@ class SmackXmppClient
                 .explicitlySetWebSocketEndpointAndDiscovery(URI(webSocketUrl), false)
                 .setWebSocketFactory(OkHttpWebSocketFactory.INSTANCE)
                 .buildModule()
-            return ModularXmppClientToServerConnection(builder.build())
+            return ModularXmppClientToServerConnection(builder.build()).apply {
+                val streamManagement = getConnectionModuleFor<StreamManagementModule>(StreamManagementModuleDescriptor::class.java)
+                streamManagement.setStreamManagementEnabled(true)
+                streamManagement.setStreamResumptionEnabled(true)
+            }
         }
 
         private fun buildTcpConnection(
@@ -1583,42 +1797,51 @@ class SmackXmppClient
                 disposition = disposition,
             )
 
-        private fun nicknameFor(session: StoredSession): Resourcepart {
-            val preferredNickname = session.username.ifBlank { session.xmppLocalpart }
-            val fallbackNickname = session.xmppLocalpart.ifBlank { DEFAULT_MUC_NICKNAME }
-            val suffix = deviceNicknameSuffix()
-            val deviceNickname =
-                listOf(preferredNickname, fallbackNickname)
-                    .firstOrNull { it.isNotBlank() }
-                    ?.let { base ->
-                        if (suffix.isBlank()) {
-                            "$base-$ANDROID_MUC_NICKNAME_SEGMENT"
-                        } else {
-                            "$base-$ANDROID_MUC_NICKNAME_SEGMENT-$suffix"
-                        }
-                    }
-            return Resourcepart.fromOrNull(deviceNickname)
-                ?: Resourcepart.fromOrNull("$fallbackNickname-$ANDROID_MUC_NICKNAME_SEGMENT")
-                ?: Resourcepart.fromOrNull(preferredNickname)
-                ?: Resourcepart.fromOrNull(fallbackNickname)
-                ?: Resourcepart.fromOrThrowUnchecked(DEFAULT_MUC_NICKNAME)
+        private fun bodyWithReplyFallback(
+            body: String,
+            replyBody: String?,
+        ): PreparedBody {
+            val quote =
+                replyBody
+                    .orEmpty()
+                    .lineSequence()
+                    .map { it.trim() }
+                    .filter { it.isNotBlank() }
+                    .take(MAX_REPLY_FALLBACK_LINES)
+                    .joinToString("\n")
+                    .take(MAX_REPLY_FALLBACK_CHARS)
+                    .ifBlank { "Previous message" }
+            val prefix =
+                quote
+                    .lineSequence()
+                    .joinToString(separator = "\n", postfix = "\n\n") { line -> "> $line" }
+            return PreparedBody(body = prefix + body, replyFallbackEnd = prefix.xmppCodePointLength())
         }
 
-        @SuppressLint("HardwareIds")
-        private fun deviceNicknameSuffix(): String =
-            runCatching {
-                Settings.Secure
-                    .getString(context.contentResolver, Settings.Secure.ANDROID_ID)
-                    .orEmpty()
-                    .filter(Char::isLetterOrDigit)
-                    .take(NICKNAME_SUFFIX_LENGTH)
-                    .lowercase()
-            }.getOrDefault("")
+        /**
+         * The MUC nickname we present as. We deliberately use the user's raw
+         * [StoredSession.username] with no device suffix so Android sends and
+         * web-client sends land under the same room nickname — they're the
+         * same user. The Waddle MUC accepts multi-session joins with the
+         * same nickname (different XMPP resources), so there's no conflict.
+         */
+        private fun nicknameFor(session: StoredSession): Resourcepart {
+            val preferred = session.username.ifBlank { session.xmppLocalpart }
+            val fallback = session.xmppLocalpart.ifBlank { DEFAULT_MUC_NICKNAME }
+            return Resourcepart.fromOrNull(preferred)
+                ?: Resourcepart.fromOrNull(fallback)
+                ?: Resourcepart.fromOrThrowUnchecked(DEFAULT_MUC_NICKNAME)
+        }
 
         private data class MentionReference(
             val uri: String,
             val begin: Int,
             val end: Int,
+        )
+
+        private data class PreparedBody(
+            val body: String,
+            val replyFallbackEnd: Int? = null,
         )
 
         private fun mentionReferences(
@@ -1631,10 +1854,11 @@ class SmackXmppClient
                     .mapNotNull { match ->
                         val nick = match.groups[1]?.value?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
                         val begin = match.range.last - nick.length
+                        val end = begin + nick.length + 1
                         MentionReference(
                             uri = "xmpp:$nick",
-                            begin = begin,
-                            end = begin + nick.length + 1,
+                            begin = body.xmppCodePointOffset(begin),
+                            end = body.xmppCodePointOffset(end),
                         )
                     }.toList()
             val fromDraft =
@@ -1658,6 +1882,12 @@ class SmackXmppClient
                 }
             }
 
+        private fun String.bareJid(): String = substringBefore('/')
+
+        private fun String.xmppCodePointLength(): Int = codePointCount(0, length)
+
+        private fun String.xmppCodePointOffset(utf16Index: Int): Int = codePointCount(0, utf16Index.coerceIn(0, length))
+
         private fun nextStanzaId(): String = StringUtils.secureUniqueRandomString()
 
         private companion object {
@@ -1666,24 +1896,64 @@ class SmackXmppClient
             // surrounding quote character on the generating side.
             val ATTR_REGEX: Regex = Regex("""([\w:-]+)=['"]([^'"]*)['"]""")
             const val DEFAULT_MUC_NICKNAME = "waddle"
-            const val ANDROID_MUC_NICKNAME_SEGMENT = "android"
             const val MAM_FIN_ELEMENT = "fin"
             const val MAM_RESULT_ELEMENT = "result"
             const val MAM_V1_NAMESPACE = "urn:xmpp:mam:1"
+            const val CALL_INVITES_NAMESPACE = "urn:xmpp:call-invites:0"
+            const val CHAT_MARKERS_NAMESPACE = "urn:xmpp:chat-markers:0"
+            const val CHAT_STATES_NAMESPACE = "http://jabber.org/protocol/chatstates"
+            const val CORRECTION_NAMESPACE = "urn:xmpp:message-correct:0"
+            const val EXPLICIT_MENTIONS_NAMESPACE = "urn:xmpp:emn:0"
+            const val FALLBACK_NAMESPACE = "urn:xmpp:fallback:0"
+            const val FILE_SHARING_NAMESPACE = "urn:xmpp:sfs:0"
+            const val FILE_METADATA_NAMESPACE = "urn:xmpp:file:metadata:0"
+            const val MUC_ACTIVITY_NAMESPACE = "urn:xmpp:muc-activity:0"
+            const val FORUMS_FEATURE = "urn:xmpp:forums:0"
+            const val ORIGIN_ID_NAMESPACE = "urn:xmpp:sid:0"
+            const val RECEIPTS_NAMESPACE = "urn:xmpp:receipts"
+            const val REFERENCE_NAMESPACE = "urn:xmpp:reference:0"
+            const val REPLY_NAMESPACE = "urn:xmpp:reply:0"
+            const val REACTIONS_NAMESPACE = "urn:xmpp:reactions:0"
+            const val RETRACTION_NAMESPACE = "urn:xmpp:message-retract:1"
+            const val RETRACTION_FALLBACK_BODY = "This message was deleted."
+            const val STICKERS_NAMESPACE = "urn:xmpp:stickers:0"
+            const val URL_DATA_NAMESPACE = "http://jabber.org/protocol/url-data"
+            const val VCARD_UPDATE_NAMESPACE = "vcard-temp:x:update"
             const val INCOMING_BUFFER_SIZE = 64
             const val MAM_COLLECTOR_SIZE = 128
             const val MAM_PAGE_SIZE = 100
             const val MAM_SEARCH_PAGE_SIZE = 50
             const val MAM_QUERY_TIMEOUT_MILLIS = 15_000L
-            const val NICKNAME_SUFFIX_LENGTH = 8
             const val RECONNECT_BASE_DELAY_SECONDS = 2
             const val MAX_RECONNECT_DELAY_SECONDS = 300
             const val MAX_RECONNECT_ATTEMPTS = 12
             const val MAX_BACKOFF_EXPONENT = 16
+            const val MAX_REPLY_FALLBACK_LINES = 3
+            const val MAX_REPLY_FALLBACK_CHARS = 160
             const val MILLIS_PER_SECOND = 1_000L
             const val RECONNECT_JITTER_RATIO = 0.2
             val MENTION_PATTERN = Regex("(?:^|\\s)@(\\S+)")
             val EVERYONE_PATTERN = Regex("(?:^|\\s)@everyone(?:\\s|$)", RegexOption.IGNORE_CASE)
             val HERE_PATTERN = Regex("(?:^|\\s)@here(?:\\s|$)", RegexOption.IGNORE_CASE)
+            val CLIENT_DISCO_FEATURES =
+                listOf(
+                    CALL_INVITES_NAMESPACE,
+                    CHAT_MARKERS_NAMESPACE,
+                    CHAT_STATES_NAMESPACE,
+                    CORRECTION_NAMESPACE,
+                    EXPLICIT_MENTIONS_NAMESPACE,
+                    FALLBACK_NAMESPACE,
+                    FILE_METADATA_NAMESPACE,
+                    FILE_SHARING_NAMESPACE,
+                    FORUMS_FEATURE,
+                    ORIGIN_ID_NAMESPACE,
+                    REACTIONS_NAMESPACE,
+                    RECEIPTS_NAMESPACE,
+                    REFERENCE_NAMESPACE,
+                    REPLY_NAMESPACE,
+                    RETRACTION_NAMESPACE,
+                    STICKERS_NAMESPACE,
+                    URL_DATA_NAMESPACE,
+                )
         }
     }

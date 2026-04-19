@@ -37,6 +37,8 @@ data class XmppChannelRef(
     val id: String,
     val name: String,
     val roomJid: String,
+    /** "text" or "forum" — derived from the room's disco#info features (XEP-0508 `urn:xmpp:forums:0`). */
+    val channelType: String,
 )
 
 data class XmppMessagePage<T>(
@@ -64,6 +66,16 @@ data class XmppCallInvite(
     val meetingDescription: String? = null,
 )
 
+/**
+ * XEP-0317 Hat — a role badge on a message sender.
+ * [uri] is the canonical role identifier (e.g. `urn:xmpp:hats:moderator`);
+ * [title] is a human-readable label (e.g. `Moderator`).
+ */
+data class WaddleHat(
+    val uri: String,
+    val title: String,
+)
+
 data class XmppHistoryMessage(
     val id: String,
     val serverId: String?,
@@ -86,7 +98,29 @@ data class XmppHistoryMessage(
     val reactionEmojis: List<String> = emptyList(),
     val displayedId: String? = null,
     val chatState: ChatState? = null,
+    val hats: List<WaddleHat> = emptyList(),
+    val threadId: String? = null,
+    val parentThreadId: String? = null,
+    val forumTopicTitle: String? = null,
+    val forumReplyThreadId: String? = null,
+    val markupRanges: List<XmppMarkupRange> = emptyList(),
 )
+
+/** XEP-0394 Message Markup: a style run over `[start, end)` of the body. */
+data class XmppMarkupRange(
+    val start: Int,
+    val end: Int,
+    val style: XmppMarkupStyle,
+)
+
+enum class XmppMarkupStyle {
+    BOLD,
+    ITALIC,
+    STRIKE,
+    CODE,
+    BLOCKQUOTE,
+    LINK,
+}
 
 data class XmppDirectMessage(
     val id: String,
@@ -98,6 +132,7 @@ data class XmppDirectMessage(
     val body: String,
     val createdAt: String,
     val editedAt: String? = null,
+    val replyToMessageId: String? = null,
     val mentions: List<String> = emptyList(),
     val broadcastMention: String? = null,
     val sharedFile: XmppSharedFile? = null,
@@ -109,6 +144,10 @@ data class XmppDirectMessage(
     val reactionEmojis: List<String> = emptyList(),
     val displayedId: String? = null,
     val chatState: ChatState? = null,
+    val hats: List<WaddleHat> = emptyList(),
+    val threadId: String? = null,
+    val parentThreadId: String? = null,
+    val markupRanges: List<XmppMarkupRange> = emptyList(),
 )
 
 interface XmppClient {
@@ -122,6 +161,23 @@ interface XmppClient {
 
     /** Map of bare JID → true when we've observed an `available` presence for that peer. */
     val presences: StateFlow<Map<String, Boolean>>
+
+    /**
+     * XEP-0502 MUC Activity Indicator: set of room JIDs the server has flagged
+     * as recently active. Callers clear entries when the user visits a room
+     * (see [clearRoomActivity]) so sidebar badges reflect unseen activity only.
+     */
+    val activeRoomJids: StateFlow<Set<String>>
+
+    /** Drop [roomJid] from the active-room set (does not notify the server). */
+    fun clearRoomActivity(roomJid: String)
+
+    /**
+     * XEP-0486 MUC Avatars: map of room JID → avatar hash. The hash is the
+     * SHA-1 announced in the room's presence update; the actual image fetch
+     * is up to the caller (typically via vCard avatar publication).
+     */
+    val roomAvatarHashes: StateFlow<Map<String, String>>
 
     suspend fun connect(
         session: StoredSession,
@@ -179,6 +235,9 @@ interface XmppClient {
         body: String,
         stanzaId: String? = null,
         sharedFile: ChatFileAttachment? = null,
+        replyToMessageId: String? = null,
+        replyToSenderJid: String? = null,
+        replyToFallbackBody: String? = null,
     ): String
 
     suspend fun markDirectDisplayed(

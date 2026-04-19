@@ -8,26 +8,38 @@ import android.provider.OpenableColumns
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.Animatable
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Reply
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
@@ -36,12 +48,16 @@ import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.AttachFile
 import androidx.compose.material.icons.rounded.ChatBubbleOutline
 import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.ContentCopy
 import androidx.compose.material.icons.rounded.Delete
 import androidx.compose.material.icons.rounded.Done
 import androidx.compose.material.icons.rounded.Edit
+import androidx.compose.material.icons.rounded.Explore
+import androidx.compose.material.icons.rounded.Forum
 import androidx.compose.material.icons.rounded.Home
 import androidx.compose.material.icons.rounded.KeyboardArrowDown
 import androidx.compose.material.icons.rounded.MoreVert
+import androidx.compose.material.icons.rounded.Notifications
 import androidx.compose.material.icons.rounded.NotificationsOff
 import androidx.compose.material.icons.rounded.Person
 import androidx.compose.material.icons.rounded.Refresh
@@ -71,6 +87,7 @@ import androidx.compose.material3.VerticalDivider
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.material3.pulltorefresh.rememberPullToRefreshState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
@@ -82,8 +99,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
@@ -93,7 +113,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.launch
 import social.waddle.android.data.db.ChannelEntity
@@ -128,6 +150,7 @@ fun ChatScreen(
     val dmReactions by viewModel.dmReactions.collectAsStateWithLifecycle()
     val displayedSummaries by viewModel.displayedSummaries.collectAsStateWithLifecycle()
     val roomTyping by viewModel.roomTyping.collectAsStateWithLifecycle()
+    val activeRoomJids by viewModel.activeRoomJids.collectAsStateWithLifecycle()
     val directTyping by viewModel.directTyping.collectAsStateWithLifecycle()
     val compact = LocalConfiguration.current.orientation == Configuration.ORIENTATION_PORTRAIT
     var activeDialog by rememberSaveable { mutableStateOf<ChatDialog?>(null) }
@@ -143,6 +166,7 @@ fun ChatScreen(
             displayedSummaries = displayedSummaries,
             roomTyping = roomTyping,
             directTyping = directTyping,
+            activeRoomJids = activeRoomJids,
         )
     val roomAttachmentHandler: (Uri, String?, String?) -> Unit = { uri, name, mimeType ->
         viewModel.sendAttachment(session, uri, name, mimeType)
@@ -163,47 +187,70 @@ fun ChatScreen(
 
     val currentWaddle = waddles.firstOrNull { it.id == state.selectedWaddleId }
     val currentChannel = channels.firstOrNull { it.id == state.selectedChannelId }
-    val insideChannel = compact && state.mode == ChatMode.Rooms && state.selectedChannelId != null
-    val insideDm = compact && state.mode == ChatMode.DirectMessages && state.selectedDmPeerJid != null
-    val showBack = insideChannel || insideDm
-    val backAction: (() -> Unit)? =
+    val navigation = compactBackNavigation(compact, state, viewModel)
+    val lightbox = rememberLightboxController()
+    BackHandler(enabled = navigation.backAction != null) { navigation.backAction?.invoke() }
+
+    CompositionLocalProvider(LocalLightbox provides lightbox) {
+        ChatScreenScaffold(
+            session = session,
+            state = state,
+            compact = compact,
+            currentWaddleName = currentWaddle?.name,
+            currentChannelName = currentChannel?.name.takeIf { navigation.insideChannel || navigation.insideThread },
+            insideThread = navigation.insideThread,
+            onBack = navigation.backAction,
+            onOpenAccount = onOpenAccount,
+            onShowRooms = viewModel::showRooms,
+            onShowDirectMessages = viewModel::showDirectMessages,
+            onShowDiscover = { viewModel.showDiscover(session) },
+            onRefresh = { viewModel.refresh(session) },
+            snackbarHost = snackbarHost,
+        ) { padding ->
+            Column(modifier = Modifier.padding(top = padding.calculateTopPadding())) {
+                social.waddle.android.ui.call
+                    .IncomingCallBanner(onAccepted = {})
+                ChatScreenContent(
+                    session = session,
+                    viewModel = viewModel,
+                    state = state,
+                    lists = lists,
+                    compact = compact,
+                    activeDialog = activeDialog,
+                    onActiveDialogChange = { activeDialog = it },
+                    onRoomAttachmentPicked = roomAttachmentHandler,
+                    onDirectMessageAttachmentPicked = directAttachmentHandler,
+                    padding = PaddingValues(bottom = padding.calculateBottomPadding()),
+                )
+            }
+        }
+        LightboxOverlay(controller = lightbox)
+    }
+}
+
+private data class CompactBackNavigation(
+    val insideThread: Boolean,
+    val insideChannel: Boolean,
+    val backAction: (() -> Unit)?,
+)
+
+private fun compactBackNavigation(
+    compact: Boolean,
+    state: ChatUiState,
+    viewModel: ChatViewModel,
+): CompactBackNavigation {
+    if (!compact) return CompactBackNavigation(false, false, null)
+    val insideThread = state.mode == ChatMode.Rooms && state.selectedThreadRootId != null
+    val insideChannel = state.mode == ChatMode.Rooms && state.selectedChannelId != null && !insideThread
+    val insideDm = state.mode == ChatMode.DirectMessages && state.selectedDmPeerJid != null
+    val back: (() -> Unit)? =
         when {
+            insideThread -> viewModel::closeThread
             insideChannel -> viewModel::clearSelectedChannel
             insideDm -> viewModel::clearDirectMessageSelection
             else -> null
         }
-    BackHandler(enabled = showBack) { backAction?.invoke() }
-
-    ChatScreenScaffold(
-        session = session,
-        state = state,
-        compact = compact,
-        currentWaddleName = currentWaddle?.name,
-        currentChannelName = currentChannel?.name.takeIf { insideChannel },
-        onBack = backAction,
-        onOpenAccount = onOpenAccount,
-        onShowRooms = viewModel::showRooms,
-        onShowDirectMessages = viewModel::showDirectMessages,
-        onRefresh = { viewModel.refresh(session) },
-        snackbarHost = snackbarHost,
-    ) { padding ->
-        Column(modifier = Modifier.padding(top = padding.calculateTopPadding())) {
-            social.waddle.android.ui.call
-                .IncomingCallBanner(onAccepted = {})
-            ChatScreenContent(
-                session = session,
-                viewModel = viewModel,
-                state = state,
-                lists = lists,
-                compact = compact,
-                activeDialog = activeDialog,
-                onActiveDialogChange = { activeDialog = it },
-                onRoomAttachmentPicked = roomAttachmentHandler,
-                onDirectMessageAttachmentPicked = directAttachmentHandler,
-                padding = PaddingValues(bottom = padding.calculateBottomPadding()),
-            )
-        }
-    }
+    return CompactBackNavigation(insideThread, insideChannel, back)
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -214,41 +261,59 @@ private fun ChatScreenScaffold(
     compact: Boolean,
     currentWaddleName: String?,
     currentChannelName: String?,
+    insideThread: Boolean,
     onBack: (() -> Unit)?,
     onOpenAccount: () -> Unit,
     onShowRooms: () -> Unit,
     onShowDirectMessages: () -> Unit,
+    onShowDiscover: () -> Unit,
     onRefresh: () -> Unit,
     snackbarHost: @Composable () -> Unit,
     content: @Composable (PaddingValues) -> Unit,
 ) {
+    val showTopBar = !compact || shouldShowCompactTopBar(state, insideThread)
     Scaffold(
         topBar = {
-            ChatTopBar(
-                session = session,
-                compact = compact,
-                mode = state.mode,
-                currentWaddleName = currentWaddleName,
-                currentChannelName = currentChannelName,
-                onBack = onBack,
-                onRefresh = onRefresh,
-                onOpenAccount = onOpenAccount,
-            )
+            if (showTopBar) {
+                ChatTopBar(
+                    session = session,
+                    compact = compact,
+                    mode = state.mode,
+                    currentWaddleName = currentWaddleName,
+                    currentChannelName = currentChannelName,
+                    insideThread = insideThread,
+                    onBack = onBack,
+                    onRefresh = onRefresh,
+                    onOpenAccount = onOpenAccount,
+                )
+            }
         },
         bottomBar = {
             if (compact) {
                 ChatBottomBar(
                     mode = state.mode,
-                    channelSelected = state.selectedChannelId != null,
                     onShowRooms = onShowRooms,
                     onShowDirectMessages = onShowDirectMessages,
-                    onOpenAccount = onOpenAccount,
+                    onShowDiscover = onShowDiscover,
                 )
             }
         },
         snackbarHost = snackbarHost,
         content = content,
     )
+}
+
+private fun shouldShowCompactTopBar(
+    state: ChatUiState,
+    insideThread: Boolean,
+): Boolean {
+    // On compact (phone) the workspace Home screen owns its own header,
+    // so we hide the scaffold's top bar there. Keep it for channels,
+    // threads, DMs, and Discover where it provides back / actions.
+    if (state.mode == ChatMode.Rooms) {
+        return state.selectedChannelId != null || insideThread
+    }
+    return true
 }
 
 private data class TopBarLabels(
@@ -262,6 +327,7 @@ private fun topBarLabels(
     mode: ChatMode,
     currentWaddleName: String?,
     currentChannelName: String?,
+    insideThread: Boolean,
 ): TopBarLabels {
     val fallbackWaddle = currentWaddleName ?: "Waddle"
     if (!compact) {
@@ -269,18 +335,33 @@ private fun topBarLabels(
     }
     return when (mode) {
         ChatMode.Rooms -> {
-            if (currentChannelName != null) {
-                TopBarLabels(
-                    title = "#$currentChannelName",
-                    subtitle = currentWaddleName ?: session.jid,
-                )
-            } else {
-                TopBarLabels(title = fallbackWaddle, subtitle = session.displayName)
+            when {
+                insideThread -> {
+                    TopBarLabels(
+                        title = "Thread",
+                        subtitle = currentChannelName?.let { "#$it" } ?: fallbackWaddle,
+                    )
+                }
+
+                currentChannelName != null -> {
+                    TopBarLabels(
+                        title = "#$currentChannelName",
+                        subtitle = currentWaddleName ?: session.jid,
+                    )
+                }
+
+                else -> {
+                    TopBarLabels(title = fallbackWaddle, subtitle = session.displayName)
+                }
             }
         }
 
         ChatMode.DirectMessages -> {
             TopBarLabels(title = "Direct messages", subtitle = session.displayName)
+        }
+
+        ChatMode.Discover -> {
+            TopBarLabels(title = "Discover", subtitle = "Public communities")
         }
     }
 }
@@ -293,11 +374,12 @@ private fun ChatTopBar(
     mode: ChatMode,
     currentWaddleName: String?,
     currentChannelName: String?,
+    insideThread: Boolean,
     onBack: (() -> Unit)?,
     onRefresh: () -> Unit,
     onOpenAccount: () -> Unit,
 ) {
-    val labels = topBarLabels(session, compact, mode, currentWaddleName, currentChannelName)
+    val labels = topBarLabels(session, compact, mode, currentWaddleName, currentChannelName, insideThread)
     TopAppBar(
         colors =
             TopAppBarDefaults.topAppBarColors(
@@ -357,54 +439,87 @@ private fun ChatTopBarActions(
     IconButton(onClick = onRefresh) {
         Icon(Icons.Rounded.Refresh, contentDescription = "Refresh")
     }
+    if (compact) {
+        IconButton(onClick = onOpenAccount) {
+            Icon(Icons.Rounded.Person, contentDescription = "Account")
+        }
+    }
 }
 
 @Composable
 private fun ChatBottomBar(
     mode: ChatMode,
-    channelSelected: Boolean,
     onShowRooms: () -> Unit,
     onShowDirectMessages: () -> Unit,
-    onOpenAccount: () -> Unit,
+    onShowDiscover: () -> Unit,
 ) {
     val colors = LocalWaddleColors.current
-    NavigationBar(
-        containerColor = MaterialTheme.colorScheme.surface,
-        tonalElevation = 0.dp,
+    Surface(
+        color = MaterialTheme.colorScheme.surface,
+        modifier = Modifier.fillMaxWidth(),
     ) {
-        val itemColors =
-            NavigationBarItemDefaults.colors(
-                selectedIconColor = MaterialTheme.colorScheme.primary,
-                selectedTextColor = MaterialTheme.colorScheme.primary,
-                indicatorColor = MaterialTheme.colorScheme.primaryContainer,
-                unselectedIconColor = colors.sidebarMuted,
-                unselectedTextColor = colors.sidebarMuted,
+        Row(
+            modifier =
+                Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 8.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceEvenly,
+        ) {
+            ChatBottomTab(
+                label = "Home",
+                icon = Icons.Rounded.Home,
+                selected = mode == ChatMode.Rooms,
+                mutedTint = colors.sidebarMuted,
+                onClick = onShowRooms,
             )
-        NavigationBarItem(
-            selected = mode == ChatMode.Rooms,
-            onClick = onShowRooms,
-            icon = {
-                Icon(
-                    imageVector = if (mode == ChatMode.Rooms && channelSelected) Icons.Rounded.Tag else Icons.Rounded.Home,
-                    contentDescription = "Home",
-                )
-            },
-            label = { Text("Home") },
-            colors = itemColors,
+            ChatBottomTab(
+                label = "DMs",
+                icon = Icons.Rounded.ChatBubbleOutline,
+                selected = mode == ChatMode.DirectMessages,
+                mutedTint = colors.sidebarMuted,
+                onClick = onShowDirectMessages,
+            )
+            ChatBottomTab(
+                label = "Discover",
+                icon = Icons.Rounded.Explore,
+                selected = mode == ChatMode.Discover,
+                mutedTint = colors.sidebarMuted,
+                onClick = onShowDiscover,
+            )
+        }
+    }
+}
+
+@Composable
+private fun ChatBottomTab(
+    label: String,
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    selected: Boolean,
+    mutedTint: Color,
+    onClick: () -> Unit,
+) {
+    val tint = if (selected) MaterialTheme.colorScheme.primary else mutedTint
+    Column(
+        modifier =
+            Modifier
+                .clickable(onClick = onClick)
+                .padding(horizontal = 10.dp, vertical = 4.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center,
+    ) {
+        Icon(
+            imageVector = icon,
+            contentDescription = label,
+            tint = tint,
+            modifier = Modifier.size(18.dp),
         )
-        NavigationBarItem(
-            selected = mode == ChatMode.DirectMessages,
-            onClick = onShowDirectMessages,
-            icon = { Icon(Icons.Rounded.ChatBubbleOutline, contentDescription = "DMs") },
-            label = { Text("DMs") },
-            colors = itemColors,
-        )
-        NavigationBarItem(
-            selected = false,
-            onClick = onOpenAccount,
-            icon = { Icon(Icons.Rounded.Person, contentDescription = "You") },
-            label = { Text("You") },
-            colors = itemColors,
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelSmall,
+            color = tint,
+            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+            fontSize = 10.sp,
         )
     }
 }
@@ -495,7 +610,23 @@ private fun ChatModeContent(
     onRoomAttachmentPicked: (Uri, String?, String?) -> Unit,
     onDirectMessageAttachmentPicked: (Uri, String?, String?) -> Unit,
 ) {
+    if (state.mode == ChatMode.Discover) {
+        DiscoverPane(
+            state = state,
+            onQueryChange = viewModel::setPublicQuery,
+            onRefresh = { viewModel.loadPublicWaddles(session) },
+            onJoin = { viewModel.joinWaddle(session, it) },
+            onOpenNewWaddle = { onActiveDialogChange(ChatDialog.NewWaddle) },
+        )
+        return
+    }
     if (state.mode == ChatMode.DirectMessages) {
+        val replyToDirectMessageId by viewModel.replyToDirectMessageId.collectAsStateWithLifecycle()
+        val directReplyPreview =
+            replyToDirectMessageId
+                ?.let { targetId ->
+                    lists.dmMessages.firstOrNull { it.id == targetId || it.serverId == targetId }
+                }?.let { ReplyPreview(it.senderName, it.body.take(200)) }
         DirectMessagesPane(
             session = session,
             state = state,
@@ -504,6 +635,7 @@ private fun ChatModeContent(
             reactions = lists.dmReactions,
             displayedSummaries = lists.displayedSummaries,
             typingByPeer = lists.directTyping,
+            replyPreview = directReplyPreview,
             onSearchUsers = { viewModel.searchDmUsers(session, it) },
             onSelectPeer = { viewModel.selectDirectMessage(session, it) },
             onClearPeer = viewModel::clearDirectMessageSelection,
@@ -514,6 +646,8 @@ private fun ChatModeContent(
             onEdit = viewModel::editDirect,
             onReact = { messageId, emoji -> viewModel.reactDirect(session, messageId, emoji) },
             onRetract = viewModel::retractDirect,
+            onStartReply = viewModel::startDirectReply,
+            onClearReply = viewModel::clearDirectReply,
             onAttachmentPicked = onDirectMessageAttachmentPicked,
         )
     } else {
@@ -551,7 +685,7 @@ private fun RoomChatLayout(
     val linkPreviews by viewModel.linkPreviews.collectAsStateWithLifecycle()
     val replyPreview =
         replyToMessageId?.let { targetId ->
-            val parent = lists.messages.firstOrNull { it.id == targetId || it.serverId == targetId }
+            val parent = lists.messages.firstOrNull { it.matchesReference(targetId) }
             parent?.let { ReplyPreview(it.senderName ?: "Unknown", it.body.take(200)) }
         }
     val layoutArgs =
@@ -562,6 +696,10 @@ private fun RoomChatLayout(
             currentChannel = lists.channels.firstOrNull { it.id == state.selectedChannelId },
             waddles = lists.waddles,
             channels = lists.channels,
+            // Pass the full message list through — the forum card view and the
+            // text timeline both need *all* messages visible so thread-meta
+            // counts include replies. The per-view filtering (topics-only for
+            // forums) happens at render time.
             messages = filteredMessages(lists.messages, state.searchQuery),
             reactionsByMessageId = lists.reactions.groupBy(ReactionSummary::messageId),
             displayedByMessageId = lists.displayedSummaries.associateBy(DeliverySummary::messageId),
@@ -605,6 +743,10 @@ private fun RoomChatLayout(
             mentionSuggestions = state.members.map { it.username },
             linkPreviews = linkPreviews,
             onRequestLinkPreview = viewModel::requestLinkPreview,
+            onOpenThread = viewModel::openThread,
+            onOpenDiscover = { viewModel.showDiscover(session) },
+            activeRoomJids = lists.activeRoomJids,
+            onSendForumTopic = { title, body -> viewModel.sendForumTopic(session, title, body) },
         )
     if (compact) {
         CompactChatLayout(args = layoutArgs)
@@ -624,6 +766,7 @@ private data class ChatScreenLists(
     val displayedSummaries: List<DeliverySummary>,
     val roomTyping: Map<String, Set<String>>,
     val directTyping: Map<String, Boolean>,
+    val activeRoomJids: Set<String>,
 )
 
 @Composable
@@ -688,82 +831,457 @@ private data class ChatLayoutArgs(
     val mentionSuggestions: List<String>,
     val linkPreviews: Map<String, social.waddle.android.data.LinkPreview>,
     val onRequestLinkPreview: (String) -> Unit,
+    val onOpenThread: (String) -> Unit,
+    val onOpenDiscover: () -> Unit,
+    val activeRoomJids: Set<String>,
+    val onSendForumTopic: (title: String, body: String) -> Unit,
 )
 
 @Composable
 private fun CompactChatLayout(args: ChatLayoutArgs) {
-    if (args.state.selectedChannelId == null) {
-        CompactWorkspaceHome(args)
-    } else {
-        CompactChannelView(args)
+    when {
+        args.state.selectedThreadRootId != null -> CompactThreadView(args)
+        args.state.selectedChannelId == null -> CompactWorkspaceHome(args)
+        else -> CompactChannelView(args)
     }
 }
 
 @Composable
 private fun CompactWorkspaceHome(args: ChatLayoutArgs) {
-    val waddleSwitcherOpen = rememberSaveable { mutableStateOf(false) }
-    LazyColumn(
+    Column(
         modifier =
             Modifier
                 .fillMaxSize()
-                .background(MaterialTheme.colorScheme.surface),
-        contentPadding = PaddingValues(vertical = 8.dp),
+                .background(MaterialTheme.colorScheme.background),
     ) {
-        item { WorkspaceSwitcherHeader(args, waddleSwitcherOpen) }
-        item { HorizontalDivider(color = LocalWaddleColors.current.divider) }
-        item {
-            MobileSectionHeader(
-                title = "Channels",
-                onAdd = args.onOpenNewChannel.takeIf { args.currentWaddle != null },
-            )
+        HomeHeader(args = args)
+        WaddleRail(args = args)
+        MobileSectionHeader(
+            title = "Channels",
+            onAdd = args.onOpenNewChannel.takeIf { args.currentWaddle != null },
+        )
+        LazyColumn(modifier = Modifier.weight(1f)) {
+            items(args.channels, key = ChannelEntity::id) { channel ->
+                HomeChannelRow(
+                    channel = channel,
+                    muted = channel.roomJid in args.mutedRoomJids,
+                    hasActivity = channel.roomJid in args.activeRoomJids,
+                    onClick = {
+                        args.state.selectedWaddleId?.let { waddleId ->
+                            args.onSelectChannel(waddleId, channel.id)
+                        }
+                    },
+                )
+            }
+            if (args.channels.isEmpty() && args.currentWaddle != null) {
+                item { MobileEmptyRow("No channels yet — tap + to create one.") }
+            }
+            if (args.currentWaddle == null && args.waddles.isEmpty()) {
+                item {
+                    MobileEmptyRow(
+                        "You haven't joined any waddles yet — tap Discover to find one.",
+                    )
+                }
+            }
         }
-        items(args.channels, key = ChannelEntity::id) { channel ->
-            MobileChannelRow(
-                channel = channel,
-                selected = false,
-                onClick = {
-                    args.state.selectedWaddleId?.let { waddleId ->
-                        args.onSelectChannel(waddleId, channel.id)
-                    }
-                },
-            )
-        }
-        if (args.channels.isEmpty() && args.currentWaddle != null) {
-            item { MobileEmptyRow("No channels yet — tap + to create one.") }
-        }
-        item { MobileActionRow(label = "Browse public waddles", onClick = args.onOpenBrowse) }
-        item {
-            Spacer(Modifier.height(8.dp))
-            HorizontalDivider(color = LocalWaddleColors.current.divider)
-        }
-        item {
-            MobileSectionHeader(
-                title = "Direct messages",
-                onAdd = args.onOpenDirectMessages,
-            )
-        }
-        items(args.dmConversations, key = DmConversationEntity::peerJid) { conversation ->
-            MobileDmRow(
-                conversation = conversation,
-                online = args.presences[conversation.peerJid] == true,
-                muted = "dm:${conversation.peerJid}" in args.mutedConversationKeys,
-                onClick = { args.onSelectDirectMessage(conversation.peerJid) },
-            )
-        }
-        if (args.dmConversations.isEmpty()) {
-            item { MobileEmptyRow("No direct messages yet — tap + to find someone.") }
-        }
-        item {
-            Spacer(Modifier.height(8.dp))
-            HorizontalDivider(color = LocalWaddleColors.current.divider)
-        }
-        item { MobileActionRow(label = "Manage members", onClick = args.onOpenMembers) }
-        item { MobileActionRow(label = "Waddle settings", onClick = args.onOpenWaddleSettings) }
     }
 }
 
 @Composable
+private fun HomeHeader(args: ChatLayoutArgs) {
+    val colors = LocalWaddleColors.current
+    Row(
+        modifier =
+            Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 20.dp, vertical = 14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        WaddleBadge(
+            name = args.currentWaddle?.name,
+            color = args.currentWaddle?.let(::waddleAccent) ?: MaterialTheme.colorScheme.primary,
+            size = 36.dp,
+        )
+        Column(Modifier.weight(1f)) {
+            Text(
+                text = args.currentWaddle?.name ?: "Waddle",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                text =
+                    args.currentWaddle?.memberCount?.let { "$it members" }
+                        ?: "Discover communities to join",
+                style = MaterialTheme.typography.bodySmall,
+                color = colors.sidebarMuted,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        IconButton(onClick = args.onOpenWaddleSettings, enabled = args.currentWaddle != null) {
+            Icon(Icons.Rounded.Notifications, contentDescription = "Waddle settings")
+        }
+    }
+}
+
+@Composable
+private fun WaddleRail(args: ChatLayoutArgs) {
+    val scrollState = rememberScrollState()
+    Row(
+        modifier =
+            Modifier
+                .fillMaxWidth()
+                .horizontalScroll(scrollState)
+                .padding(start = 16.dp, end = 16.dp, top = 4.dp, bottom = 16.dp),
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        args.waddles.forEach { waddle ->
+            WaddleRailItem(
+                waddle = waddle,
+                active = waddle.id == args.state.selectedWaddleId,
+                onClick = { args.onSelectWaddle(waddle.id) },
+            )
+        }
+        WaddleRailAdd(onClick = args.onOpenDiscover)
+    }
+}
+
+@Composable
+private fun WaddleRailItem(
+    waddle: WaddleEntity,
+    active: Boolean,
+    onClick: () -> Unit,
+) {
+    val accent = MaterialTheme.colorScheme.primary
+    val background = MaterialTheme.colorScheme.background
+    val badgeModifier =
+        if (active) {
+            Modifier.border(2.dp, accent, RoundedCornerShape(14.dp))
+        } else {
+            Modifier
+        }
+    Box(
+        modifier =
+            Modifier
+                .padding(if (active) 3.dp else 0.dp)
+                .then(badgeModifier)
+                .padding(if (active) 3.dp else 0.dp)
+                .background(background, RoundedCornerShape(14.dp))
+                .clickable(onClick = onClick),
+    ) {
+        WaddleBadge(
+            name = waddle.name,
+            color = waddleAccent(waddle),
+            size = 46.dp,
+        )
+    }
+}
+
+@Composable
+private fun WaddleRailAdd(onClick: () -> Unit) {
+    val colors = LocalWaddleColors.current
+    Box(
+        modifier =
+            Modifier
+                .size(46.dp)
+                .border(1.dp, colors.divider, RoundedCornerShape(14.dp))
+                .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) {
+        Icon(
+            imageVector = Icons.Rounded.Add,
+            contentDescription = "Add waddle",
+            tint = colors.sidebarMuted,
+            modifier = Modifier.size(20.dp),
+        )
+    }
+}
+
+@Composable
+private fun WaddleBadge(
+    name: String?,
+    color: Color,
+    size: androidx.compose.ui.unit.Dp,
+) {
+    Surface(
+        color = color,
+        contentColor = Color.White,
+        shape = RoundedCornerShape(size / 3.3f),
+        modifier = Modifier.size(size),
+    ) {
+        Box(contentAlignment = Alignment.Center) {
+            Text(
+                text = name?.firstOrNull()?.uppercaseChar()?.toString() ?: "W",
+                fontWeight = FontWeight.Bold,
+                style = MaterialTheme.typography.titleMedium,
+            )
+        }
+    }
+}
+
+@Composable
+private fun HomeChannelRow(
+    channel: ChannelEntity,
+    muted: Boolean,
+    hasActivity: Boolean,
+    onClick: () -> Unit,
+) {
+    val colors = LocalWaddleColors.current
+    Row(
+        modifier =
+            Modifier
+                .fillMaxWidth()
+                .clickable(onClick = onClick)
+                .padding(horizontal = 20.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Icon(
+            imageVector = if (channel.channelType == "forum") Icons.Rounded.Forum else Icons.Rounded.Tag,
+            contentDescription = if (channel.channelType == "forum") "Forum channel" else null,
+            tint = if (hasActivity && !muted) MaterialTheme.colorScheme.primary else colors.sidebarMuted,
+            modifier = Modifier.size(16.dp),
+        )
+        Text(
+            text = channel.name,
+            modifier = Modifier.weight(1f),
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurface,
+            fontWeight = if (hasActivity && !muted) FontWeight.SemiBold else FontWeight.Normal,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+        if (hasActivity && !muted) {
+            Box(
+                modifier =
+                    Modifier
+                        .size(8.dp)
+                        .background(MaterialTheme.colorScheme.primary, CircleShape),
+            )
+        }
+        if (muted) {
+            Icon(
+                imageVector = Icons.Rounded.NotificationsOff,
+                contentDescription = "Muted",
+                tint = colors.sidebarMuted,
+                modifier = Modifier.size(14.dp),
+            )
+        }
+    }
+}
+
+/**
+ * Forum topic list: a stream of tappable topic cards. Each card is a
+ * self-contained unit with the topic title, an excerpt of the opening post,
+ * the author / timestamp, and a participant stack + reply footer. Tapping a
+ * card opens the thread. Inspired by Discord forum channels and Reddit's
+ * post list — a "forum" should *feel* like a forum, not a filtered chat.
+ */
+@Composable
+private fun ForumTopicList(
+    topics: List<MessageEntity>,
+    threadMetaByRoot: Map<String, ThreadMeta>,
+    modifier: Modifier = Modifier,
+    onOpenTopic: (String) -> Unit,
+) {
+    val colors = LocalWaddleColors.current
+    // `topics` is actually the full message list for the channel; filter to
+    // roots here (topics only) so the card feed doesn't render replies
+    // inline — they belong in the thread view. We do need the full list
+    // upstream so thread-meta counts include the replies.
+    val roots =
+        remember(topics) {
+            topics.filter { it.forumTopicTitle != null || it.forumReplyThreadId == null }
+        }
+    if (roots.isEmpty()) {
+        Box(
+            modifier = modifier.fillMaxSize().padding(24.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(
+                text = "No topics yet. Start one below 👇",
+                style = MaterialTheme.typography.bodyMedium,
+                color = colors.sidebarMuted,
+            )
+        }
+        return
+    }
+    val sortedTopics =
+        remember(roots, threadMetaByRoot) {
+            roots.sortedByDescending { topic ->
+                threadMetaByRoot[topic.threadKey]?.lastReplyAt ?: topic.createdAt
+            }
+        }
+    LazyColumn(
+        modifier = modifier.fillMaxSize(),
+        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        items(sortedTopics, key = MessageEntity::id) { topic ->
+            ForumTopicCard(
+                topic = topic,
+                meta = threadMetaByRoot[topic.threadKey],
+                onClick = { onOpenTopic(topic.threadKey) },
+            )
+        }
+    }
+}
+
+@Composable
+private fun ForumTopicCard(
+    topic: MessageEntity,
+    meta: ThreadMeta?,
+    onClick: () -> Unit,
+) {
+    val colors = LocalWaddleColors.current
+    val replyCount = meta?.count ?: 0
+    val lastActivity =
+        remember(meta?.lastReplyAt, topic.createdAt) {
+            formatRelativeTimestamp(meta?.lastReplyAt ?: topic.createdAt)
+        }
+    Surface(
+        shape = RoundedCornerShape(16.dp),
+        color = colors.composerSurface,
+        border = BorderStroke(1.dp, colors.divider),
+        modifier =
+            Modifier
+                .fillMaxWidth()
+                .clickable(onClick = onClick),
+    ) {
+        Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp)) {
+            ForumTopicHeader(topic = topic)
+            Spacer(Modifier.height(8.dp))
+            topic.forumTopicTitle?.takeIf(String::isNotBlank)?.let { title ->
+                Text(
+                    text = title,
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Spacer(Modifier.height(4.dp))
+            }
+            Text(
+                text = topic.body,
+                style = MaterialTheme.typography.bodyMedium,
+                color = colors.sidebarMuted,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Spacer(Modifier.height(12.dp))
+            ForumTopicFooter(
+                replyCount = replyCount,
+                participantNames = meta?.participantNames.orEmpty(),
+                lastActivity = lastActivity,
+            )
+        }
+    }
+}
+
+@Composable
+private fun ForumTopicHeader(topic: MessageEntity) {
+    val colors = LocalWaddleColors.current
+    val author = topic.senderName ?: "someone"
+    val started = remember(topic.createdAt) { formatRelativeTimestamp(topic.createdAt) }
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Box(
+            modifier =
+                Modifier
+                    .size(20.dp)
+                    .background(waddleSummaryAccent(author), CircleShape),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(
+                text = author.firstOrNull()?.uppercaseChar()?.toString() ?: "?",
+                style = MaterialTheme.typography.labelSmall,
+                color = Color.White,
+                fontWeight = FontWeight.Bold,
+                fontSize = 10.sp,
+            )
+        }
+        Text(
+            text = author,
+            style = MaterialTheme.typography.labelMedium,
+            fontWeight = FontWeight.SemiBold,
+            color = MaterialTheme.colorScheme.onSurface,
+        )
+        started?.let {
+            Text(
+                text = "·  $it",
+                style = MaterialTheme.typography.labelMedium,
+                color = colors.sidebarMuted,
+            )
+        }
+    }
+}
+
+@Composable
+private fun ForumTopicFooter(
+    replyCount: Int,
+    participantNames: List<String>,
+    lastActivity: String?,
+) {
+    val colors = LocalWaddleColors.current
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        if (participantNames.isNotEmpty()) {
+            ThreadParticipantStack(names = participantNames)
+        }
+        val countText =
+            when (replyCount) {
+                0 -> "No replies yet"
+                1 -> "1 reply"
+                else -> "$replyCount replies"
+            }
+        Text(
+            text = countText,
+            style = MaterialTheme.typography.labelMedium,
+            fontWeight = FontWeight.SemiBold,
+            color = if (replyCount > 0) MaterialTheme.colorScheme.primary else colors.sidebarMuted,
+        )
+        lastActivity?.takeIf { replyCount > 0 }?.let {
+            Text(
+                text = "·  $it",
+                style = MaterialTheme.typography.labelSmall,
+                color = colors.sidebarMuted,
+            )
+        }
+    }
+}
+
+private val WADDLE_ACCENT_PALETTE: List<Color> =
+    listOf(
+        Color(0xFF00C4AB),
+        Color(0xFFF97316),
+        Color(0xFF3B82F6),
+        Color(0xFF8B5CF6),
+        Color(0xFFEC4899),
+        Color(0xFF10B981),
+        Color(0xFFF59E0B),
+        Color(0xFF6366F1),
+    )
+
+private fun waddleAccent(waddle: WaddleEntity): Color = waddleSummaryAccent(waddle.id)
+
+private fun waddleSummaryAccent(id: String): Color {
+    val index = (id.hashCode() and 0x7FFFFFFF) % WADDLE_ACCENT_PALETTE.size
+    return WADDLE_ACCENT_PALETTE[index]
+}
+
+@Composable
 private fun CompactChannelView(args: ChatLayoutArgs) {
+    val replyCountsByRootKey = remember(args.messages) { args.messages.threadMetaByRoot() }
+    val isForum = args.currentChannel?.channelType == "forum"
     Column(
         Modifier
             .fillMaxSize()
@@ -781,21 +1299,32 @@ private fun CompactChannelView(args: ChatLayoutArgs) {
                 },
             )
         }
-        Timeline(
-            session = args.session,
-            messages = args.messages,
-            reactionsByMessageId = args.reactionsByMessageId,
-            displayedByMessageId = args.displayedByMessageId,
-            linkPreviews = args.linkPreviews,
-            modifier = Modifier.weight(1f),
-            onLoadOlder = args.onLoadOlder,
-            onDisplayed = args.onDisplayed,
-            onEdit = args.onEdit,
-            onReact = args.onReact,
-            onRetract = args.onRetract,
-            onStartReply = args.onStartReply,
-            onRequestLinkPreview = args.onRequestLinkPreview,
-        )
+        if (isForum) {
+            ForumTopicList(
+                topics = args.messages,
+                threadMetaByRoot = replyCountsByRootKey,
+                modifier = Modifier.weight(1f),
+                onOpenTopic = args.onOpenThread,
+            )
+        } else {
+            Timeline(
+                session = args.session,
+                messages = args.messages,
+                reactionsByMessageId = args.reactionsByMessageId,
+                displayedByMessageId = args.displayedByMessageId,
+                linkPreviews = args.linkPreviews,
+                replyCountsByRootKey = replyCountsByRootKey,
+                modifier = Modifier.weight(1f),
+                onLoadOlder = args.onLoadOlder,
+                onDisplayed = args.onDisplayed,
+                onEdit = args.onEdit,
+                onReact = args.onReact,
+                onRetract = args.onRetract,
+                onStartReply = args.onStartReply,
+                onOpenThread = args.onOpenThread,
+                onRequestLinkPreview = args.onRequestLinkPreview,
+            )
+        }
         Composer(
             sending = args.state.sending,
             enabled = args.state.selectedChannelId != null,
@@ -804,74 +1333,14 @@ private fun CompactChannelView(args: ChatLayoutArgs) {
             initialText = args.draftText,
             replyPreview = args.replyPreview,
             mentionSuggestions = args.mentionSuggestions,
+            forumTopicMode = isForum,
             onTextChanged = args.onDraftChange,
             onClearReply = args.onClearReply,
             onTyping = args.onTyping,
             onSend = args.onSend,
+            onSendTopic = args.onSendForumTopic,
             onAttachmentPicked = args.onAttachmentPicked,
         )
-    }
-}
-
-@Composable
-private fun WorkspaceSwitcherHeader(
-    args: ChatLayoutArgs,
-    expanded: androidx.compose.runtime.MutableState<Boolean>,
-) {
-    val colors = LocalWaddleColors.current
-    Row(
-        modifier =
-            Modifier
-                .fillMaxWidth()
-                .clickable(enabled = args.waddles.size > 1) { expanded.value = !expanded.value }
-                .padding(horizontal = 16.dp, vertical = 12.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(12.dp),
-    ) {
-        WorkspaceBadge(name = args.currentWaddle?.name)
-        Column(Modifier.weight(1f)) {
-            Text(
-                text = args.currentWaddle?.name ?: "Waddle",
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.Bold,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-            Text(
-                text =
-                    args.currentWaddle?.memberCount?.let { "$it members" }
-                        ?: "Browse and create waddles below",
-                style = MaterialTheme.typography.bodySmall,
-                color = colors.sidebarMuted.takeIf { false } ?: MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-        }
-        if (args.waddles.size > 1) {
-            IconButton(onClick = { expanded.value = !expanded.value }) {
-                Icon(Icons.Rounded.MoreVert, contentDescription = "Switch waddle")
-            }
-            DropdownMenu(
-                expanded = expanded.value,
-                onDismissRequest = { expanded.value = false },
-            ) {
-                args.waddles.forEach { waddle ->
-                    DropdownMenuItem(
-                        text = { Text(waddle.name) },
-                        onClick = {
-                            expanded.value = false
-                            args.onSelectWaddle(waddle.id)
-                        },
-                    )
-                }
-            }
-        } else {
-            TextButton(onClick = args.onOpenNewWaddle) {
-                Icon(Icons.Rounded.Add, contentDescription = null)
-                Spacer(Modifier.width(4.dp))
-                Text("New")
-            }
-        }
     }
 }
 
@@ -918,157 +1387,6 @@ private fun MobileSectionHeader(
                 Icon(Icons.Rounded.Add, contentDescription = "Add")
             }
         }
-    }
-}
-
-@Composable
-private fun MobileChannelRow(
-    channel: ChannelEntity,
-    selected: Boolean,
-    onClick: () -> Unit,
-) {
-    val contentColor =
-        if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
-    Row(
-        modifier =
-            Modifier
-                .fillMaxWidth()
-                .clickable(onClick = onClick)
-                .padding(horizontal = 20.dp, vertical = 10.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(12.dp),
-    ) {
-        Icon(
-            imageVector = Icons.Rounded.Tag,
-            contentDescription = null,
-            tint = contentColor,
-            modifier = Modifier.size(18.dp),
-        )
-        Text(
-            text = channel.name,
-            modifier = Modifier.weight(1f),
-            style = MaterialTheme.typography.bodyLarge,
-            color = contentColor,
-            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-        )
-        channel.topic?.takeIf(String::isNotBlank)?.let { topic ->
-            Text(
-                text = topic,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.weight(1f),
-            )
-        }
-    }
-}
-
-@Composable
-private fun MobileDmRow(
-    conversation: DmConversationEntity,
-    online: Boolean,
-    muted: Boolean,
-    onClick: () -> Unit,
-) {
-    Row(
-        modifier =
-            Modifier
-                .fillMaxWidth()
-                .clickable(onClick = onClick)
-                .padding(horizontal = 20.dp, vertical = 10.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(12.dp),
-    ) {
-        Box {
-            AvatarInitial(name = conversation.peerUsername)
-            if (online) {
-                Surface(
-                    color = LocalWaddleColors.current.presenceOnline,
-                    shape = androidx.compose.foundation.shape.CircleShape,
-                    border =
-                        androidx.compose.foundation.BorderStroke(
-                            2.dp,
-                            MaterialTheme.colorScheme.surface,
-                        ),
-                    modifier =
-                        Modifier
-                            .align(Alignment.BottomEnd)
-                            .size(12.dp),
-                ) {}
-            }
-        }
-        Column(Modifier.weight(1f)) {
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                Text(
-                    text = conversation.peerUsername,
-                    modifier = Modifier.weight(1f, fill = false),
-                    style = MaterialTheme.typography.bodyLarge,
-                    fontWeight = FontWeight.SemiBold,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                if (muted) {
-                    Icon(
-                        imageVector = Icons.Rounded.NotificationsOff,
-                        contentDescription = "Muted",
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.size(14.dp),
-                    )
-                }
-            }
-            Text(
-                text = conversation.lastMessageBody ?: conversation.peerJid,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-        }
-        if (conversation.unreadCount > 0 && !muted) {
-            Surface(
-                color = MaterialTheme.colorScheme.primary,
-                contentColor = MaterialTheme.colorScheme.onPrimary,
-                shape = RoundedCornerShape(10.dp),
-            ) {
-                Text(
-                    text = conversation.unreadCount.toString(),
-                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
-                    style = MaterialTheme.typography.labelSmall,
-                    fontWeight = FontWeight.Bold,
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun MobileActionRow(
-    label: String,
-    onClick: () -> Unit,
-) {
-    Row(
-        modifier =
-            Modifier
-                .fillMaxWidth()
-                .clickable(onClick = onClick)
-                .padding(horizontal = 20.dp, vertical = 12.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(12.dp),
-    ) {
-        Icon(
-            imageVector = Icons.Rounded.Add,
-            contentDescription = null,
-            tint = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.size(18.dp),
-        )
-        Text(
-            text = label,
-            style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
     }
 }
 
@@ -1173,6 +1491,575 @@ private fun MobileChannelToolbar(args: ChatLayoutArgs) {
 }
 
 @Composable
+private fun DiscoverPane(
+    state: ChatUiState,
+    onQueryChange: (String) -> Unit,
+    onRefresh: () -> Unit,
+    onJoin: (String) -> Unit,
+    onOpenNewWaddle: () -> Unit,
+) {
+    LaunchedEffect(Unit) { onRefresh() }
+    Column(
+        modifier =
+            Modifier
+                .fillMaxSize()
+                .background(MaterialTheme.colorScheme.background),
+    ) {
+        DiscoverHeader(onOpenNewWaddle = onOpenNewWaddle)
+        DiscoverSearchField(
+            query = state.publicQuery,
+            busy = state.busy,
+            onQueryChange = onQueryChange,
+        )
+        DiscoverResultsList(
+            waddles = state.publicWaddles,
+            busy = state.busy,
+            onJoin = onJoin,
+        )
+    }
+}
+
+@Composable
+private fun DiscoverHeader(onOpenNewWaddle: () -> Unit) {
+    val colors = LocalWaddleColors.current
+    Row(
+        modifier = Modifier.padding(horizontal = 20.dp, vertical = 14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(
+                text = "Discover",
+                style = MaterialTheme.typography.headlineSmall,
+                fontWeight = FontWeight.Bold,
+            )
+            Text(
+                text = "Public communities",
+                style = MaterialTheme.typography.bodySmall,
+                color = colors.sidebarMuted,
+            )
+        }
+        Surface(
+            color = MaterialTheme.colorScheme.primary,
+            contentColor = MaterialTheme.colorScheme.onPrimary,
+            shape = CircleShape,
+            modifier = Modifier.size(36.dp).clickable(onClick = onOpenNewWaddle),
+        ) {
+            Box(contentAlignment = Alignment.Center) {
+                Icon(Icons.Rounded.Add, contentDescription = "Create waddle")
+            }
+        }
+    }
+}
+
+@Composable
+private fun DiscoverSearchField(
+    query: String,
+    busy: Boolean,
+    onQueryChange: (String) -> Unit,
+) {
+    val colors = LocalWaddleColors.current
+    Surface(
+        color = colors.composerSurface,
+        shape = RoundedCornerShape(12.dp),
+        modifier =
+            Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 4.dp),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Icon(
+                imageVector = Icons.Rounded.Search,
+                contentDescription = null,
+                tint = colors.sidebarMuted,
+                modifier = Modifier.size(16.dp),
+            )
+            OutlinedTextField(
+                value = query,
+                onValueChange = onQueryChange,
+                modifier = Modifier.weight(1f),
+                singleLine = true,
+                placeholder = { Text("Search communities", color = colors.sidebarMuted) },
+                colors =
+                    androidx.compose.material3.OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = Color.Transparent,
+                        unfocusedBorderColor = Color.Transparent,
+                        disabledBorderColor = Color.Transparent,
+                        focusedContainerColor = Color.Transparent,
+                        unfocusedContainerColor = Color.Transparent,
+                    ),
+            )
+            if (busy) {
+                androidx.compose.material3.CircularProgressIndicator(
+                    modifier = Modifier.size(18.dp),
+                    strokeWidth = 2.dp,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun DiscoverResultsList(
+    waddles: List<social.waddle.android.data.model.WaddleSummary>,
+    busy: Boolean,
+    onJoin: (String) -> Unit,
+) {
+    val colors = LocalWaddleColors.current
+    LazyColumn(
+        modifier =
+            Modifier
+                .fillMaxSize()
+                .padding(horizontal = 16.dp, vertical = 10.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        items(waddles, key = { it.id }) { waddle ->
+            DiscoverRow(waddle = waddle, onJoin = { onJoin(waddle.id) })
+        }
+        if (waddles.isEmpty() && !busy) {
+            item {
+                Text(
+                    text = "No public communities matched your search.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = colors.sidebarMuted,
+                    modifier = Modifier.padding(vertical = 24.dp),
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun DiscoverRow(
+    waddle: social.waddle.android.data.model.WaddleSummary,
+    onJoin: () -> Unit,
+) {
+    val colors = LocalWaddleColors.current
+    Surface(
+        shape = RoundedCornerShape(14.dp),
+        border = BorderStroke(1.dp, colors.divider),
+        color = MaterialTheme.colorScheme.background,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Row(
+            modifier = Modifier.padding(14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            WaddleBadge(
+                name = waddle.name,
+                color = waddleSummaryAccent(waddle.id),
+                size = 44.dp,
+            )
+            Column(Modifier.weight(1f)) {
+                Text(
+                    text = waddle.name,
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                waddle.description?.takeIf(String::isNotBlank)?.let {
+                    Text(
+                        text = it,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = colors.sidebarMuted,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+            val joined = waddle.role != null
+            Surface(
+                color = Color.Transparent,
+                contentColor = MaterialTheme.colorScheme.primary,
+                shape = RoundedCornerShape(999.dp),
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary),
+                modifier = Modifier.clickable(enabled = !joined, onClick = onJoin),
+            ) {
+                Text(
+                    text = if (joined) "Joined" else "Join",
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp),
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun CompactThreadView(args: ChatLayoutArgs) {
+    val rootKey = args.state.selectedThreadRootId ?: return
+    // rootKey might be a stanza-id (our preferred) OR an origin-id (from a
+    // legacy peer) — accept either when resolving the root and its replies.
+    val root = remember(args.messages, rootKey) { args.messages.firstOrNull { it.matchesReference(rootKey) } }
+    val replies =
+        remember(args.messages, rootKey, root) {
+            val target = root ?: return@remember emptyList()
+            args.messages.filter { message ->
+                val ref = message.forumReplyThreadId ?: message.replyToMessageId ?: return@filter false
+                target.matchesReference(ref)
+            }
+        }
+    val colors = LocalWaddleColors.current
+    Column(
+        Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.background),
+    ) {
+        if (root == null) {
+            Box(Modifier.weight(1f).fillMaxWidth().padding(24.dp), contentAlignment = Alignment.Center) {
+                Text(
+                    text = "This message is no longer available.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = colors.sidebarMuted,
+                )
+            }
+        } else {
+            ThreadViewContent(
+                root = root,
+                replies = replies,
+                channelName = args.currentChannel?.name,
+                session = args.session,
+                reactionsByMessageId = args.reactionsByMessageId,
+                displayedByMessageId = args.displayedByMessageId,
+                linkPreviews = args.linkPreviews,
+                modifier = Modifier.weight(1f),
+                onEdit = args.onEdit,
+                onReact = args.onReact,
+                onRetract = args.onRetract,
+                onStartReply = args.onStartReply,
+                onRequestLinkPreview = args.onRequestLinkPreview,
+            )
+        }
+        Composer(
+            sending = args.state.sending,
+            enabled = true,
+            channelName = root?.senderName ?: args.currentChannel?.name,
+            conversationKey = "thread:$rootKey",
+            initialText = "",
+            replyPreview = args.replyPreview,
+            mentionSuggestions = args.mentionSuggestions,
+            onTextChanged = { /* drafts not persisted for threads */ },
+            onClearReply = args.onClearReply,
+            onTyping = args.onTyping,
+            onSend = args.onSend,
+            onAttachmentPicked = args.onAttachmentPicked,
+        )
+    }
+}
+
+@Suppress("LongParameterList")
+@Composable
+private fun ThreadViewContent(
+    root: MessageEntity,
+    replies: List<MessageEntity>,
+    channelName: String?,
+    session: AuthSession,
+    reactionsByMessageId: Map<String, List<ReactionSummary>>,
+    displayedByMessageId: Map<String, DeliverySummary>,
+    linkPreviews: Map<String, social.waddle.android.data.LinkPreview>,
+    modifier: Modifier = Modifier,
+    onEdit: (String, String) -> Unit,
+    onReact: (String, String) -> Unit,
+    onRetract: (String) -> Unit,
+    onStartReply: (MessageEntity) -> Unit,
+    onRequestLinkPreview: (String) -> Unit,
+) {
+    val colors = LocalWaddleColors.current
+    LazyColumn(
+        modifier = modifier.fillMaxSize(),
+        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        item {
+            ThreadViewSubheader(
+                root = root,
+                channelName = channelName,
+                replyCount = replies.size,
+                participantNames = replies.mapNotNull { it.senderName }.distinct().take(MAX_THREAD_PARTICIPANTS),
+            )
+        }
+        item { ThreadRootCard(root = root) }
+        if (replies.isEmpty()) {
+            item {
+                Text(
+                    text = "Be the first to reply.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = colors.sidebarMuted,
+                    modifier = Modifier.padding(vertical = 20.dp, horizontal = 16.dp),
+                )
+            }
+        } else {
+            item {
+                Row(
+                    modifier = Modifier.padding(vertical = 6.dp, horizontal = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    HorizontalDivider(modifier = Modifier.weight(1f), color = colors.divider)
+                    Text(
+                        text = if (replies.size == 1) "1 reply" else "${replies.size} replies",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = colors.sidebarMuted,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    HorizontalDivider(modifier = Modifier.weight(1f), color = colors.divider)
+                }
+            }
+            items(replies, key = MessageEntity::id) { reply ->
+                ThreadReplyRow(
+                    reply = reply,
+                    session = session,
+                    reactions =
+                        (
+                            reactionsByMessageId[reply.id].orEmpty() +
+                                reactionsByMessageId[reply.serverId].orEmpty() +
+                                reactionsByMessageId[reply.originStanzaId].orEmpty()
+                        ).distinctBy { it.emoji },
+                    displayedCount =
+                        displayedByMessageId[reply.id]?.count
+                            ?: reply.serverId?.let { displayedByMessageId[it]?.count }
+                            ?: reply.originStanzaId?.let { displayedByMessageId[it]?.count }
+                            ?: 0,
+                    linkPreviews = linkPreviews,
+                    onEdit = onEdit,
+                    onReact = onReact,
+                    onRetract = onRetract,
+                    onStartReply = onStartReply,
+                    onRequestLinkPreview = onRequestLinkPreview,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ThreadViewSubheader(
+    root: MessageEntity,
+    channelName: String?,
+    replyCount: Int,
+    participantNames: List<String>,
+) {
+    val colors = LocalWaddleColors.current
+    val started = remember(root.createdAt) { formatRelativeTimestamp(root.createdAt) }
+    Column {
+        root.forumTopicTitle?.takeIf(String::isNotBlank)?.let { title ->
+            Text(
+                text = title,
+                style = MaterialTheme.typography.headlineSmall,
+                fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+            Spacer(Modifier.height(6.dp))
+        }
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            if (participantNames.isNotEmpty()) {
+                ThreadParticipantStack(names = participantNames)
+            }
+            Text(
+                text =
+                    buildString {
+                        append(
+                            when (replyCount) {
+                                0 -> "No replies yet"
+                                1 -> "1 reply"
+                                else -> "$replyCount replies"
+                            },
+                        )
+                        val byline = root.senderName?.let { "started by $it" }
+                        listOfNotNull(byline, started?.let { "· $it" }, channelName?.let { "in #$it" })
+                            .forEach { append("  ·  $it") }
+                    },
+                style = MaterialTheme.typography.bodySmall,
+                color = colors.sidebarMuted,
+            )
+        }
+    }
+}
+
+/**
+ * The "hero" root card of a thread: visually elevated with a tinted surface
+ * and accent left-bar so it reads as the anchor of the discussion rather
+ * than just another message.
+ */
+@Composable
+private fun ThreadRootCard(root: MessageEntity) {
+    val colors = LocalWaddleColors.current
+    Surface(
+        shape = RoundedCornerShape(14.dp),
+        color = colors.accentSoft,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Row(modifier = Modifier.height(IntrinsicSize.Min)) {
+            Box(
+                modifier =
+                    Modifier
+                        .width(3.dp)
+                        .fillMaxHeight()
+                        .background(MaterialTheme.colorScheme.primary),
+            )
+            Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp)) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    AvatarInitial(name = root.senderName)
+                    Column {
+                        Text(
+                            text = root.senderName ?: "unknown",
+                            style = MaterialTheme.typography.labelLarge,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.onSurface,
+                        )
+                        Text(
+                            text = formatMessageStamp(root.createdAt),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = colors.sidebarMuted,
+                        )
+                    }
+                }
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    text = root.body,
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+            }
+        }
+    }
+}
+
+/**
+ * Compact reply row used inside the thread view. Similar to MessageRow but
+ * without the swipe-to-reply wrapper (the thread composer always targets
+ * the root) and without the thread chip (we're already in the thread).
+ */
+@Suppress("LongParameterList")
+@Composable
+private fun ThreadReplyRow(
+    reply: MessageEntity,
+    session: AuthSession,
+    reactions: List<ReactionSummary>,
+    displayedCount: Int,
+    linkPreviews: Map<String, social.waddle.android.data.LinkPreview>,
+    onEdit: (String, String) -> Unit,
+    onReact: (String, String) -> Unit,
+    onRetract: (String) -> Unit,
+    onStartReply: (MessageEntity) -> Unit,
+    onRequestLinkPreview: (String) -> Unit,
+) {
+    MessageRow(
+        session = session,
+        message = reply,
+        parentMessage = null,
+        reactions = reactions,
+        displayedCount = displayedCount,
+        own = reply.senderId == session.stored.userId,
+        linkPreviews = linkPreviews,
+        threadMeta = null,
+        onEdit = { body -> onEdit(reply.messageKey, body) },
+        onReact = { emoji -> onReact(reply.messageKey, emoji) },
+        onRetract = { onRetract(reply.messageKey) },
+        onStartReply = { onStartReply(reply) },
+        onOpenThread = { /* already in thread */ },
+        onRequestLinkPreview = onRequestLinkPreview,
+    )
+}
+
+/**
+ * Copy [text] to the system clipboard. We use the framework ClipboardManager
+ * directly rather than Compose's LocalClipboardManager — the latter was
+ * deprecated in favour of a suspend-capable API, but for a fire-and-forget
+ * copy the framework API is simpler.
+ */
+private fun copyToClipboard(
+    context: android.content.Context,
+    text: String,
+) {
+    val manager = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager ?: return
+    manager.setPrimaryClip(android.content.ClipData.newPlainText("Waddle message", text))
+}
+
+/**
+ * Per-thread metadata used to render the "N replies · last from X" chip.
+ * [participantNames] holds up to [MAX_THREAD_PARTICIPANTS] unique replier
+ * names, newest first; [lastReplyAt] is the server timestamp of the most
+ * recent reply (ISO-8601 or null if unknown).
+ */
+private data class ThreadMeta(
+    val count: Int,
+    val participantNames: List<String>,
+    val lastReplyAt: String?,
+)
+
+private const val MAX_THREAD_PARTICIPANTS = 3
+
+/**
+ * Build a thread-metadata map keyed by each root's [MessageEntity.threadKey].
+ * Incoming replies may reference their parent by either the room-assigned
+ * XEP-0359 stanza-id or the sender's origin-id, so we first resolve every ref
+ * to the root's canonical threadKey and then group.
+ */
+private fun List<MessageEntity>.threadMetaByRoot(): Map<String, ThreadMeta> {
+    // id-alias → canonical-threadKey map, populated from every message so a
+    // reply can find its parent by stanza-id OR origin-id OR local row id.
+    val canonicalByRef: Map<String, String> =
+        buildMap {
+            for (message in this@threadMetaByRoot) {
+                val canonical = message.threadKey
+                message.serverId?.let { put(it, canonical) }
+                message.originStanzaId?.let { put(it, canonical) }
+                put(message.id, canonical)
+            }
+        }
+    val grouped =
+        asSequence()
+            .mapNotNull { reply ->
+                val ref = reply.forumReplyThreadId ?: reply.replyToMessageId ?: return@mapNotNull null
+                val canonical = canonicalByRef[ref] ?: ref
+                canonical to reply
+            }.groupBy({ it.first }, { it.second })
+    return grouped.mapValues { (_, children) ->
+        val sorted = children.sortedByDescending { it.createdAt }
+        ThreadMeta(
+            count = children.size,
+            participantNames =
+                sorted
+                    .mapNotNull { it.senderName }
+                    .distinct()
+                    .take(MAX_THREAD_PARTICIPANTS),
+            lastReplyAt = sorted.firstOrNull()?.createdAt,
+        )
+    }
+}
+
+/**
+ * The id we put on every outgoing room wire reference to this message —
+ * `<reply id=…>`, `<reactions id=…>`, `<retract id=…>`, `<replace id=…>`,
+ * `<thread>…`, `<thread-reply thread-id=…>`. XEP-0461, XEP-0424, and
+ * XEP-0444 require the room-assigned XEP-0359 stanza-id for groupchat
+ * references when it is available. Origin-id remains an alias for resolving
+ * older incoming references.
+ */
+private val MessageEntity.threadKey: String
+    get() = serverId ?: originStanzaId ?: id
+
+/**
+ * Does this message match [key] under any of the identifiers peers might use
+ * to point at it: the MUC stanza-id, the origin-id the sender chose, or the
+ * local row id?
+ */
+private fun MessageEntity.matchesReference(key: String): Boolean = serverId == key || originStanzaId == key || id == key
+
+@Composable
 private fun WideChatLayout(args: ChatLayoutArgs) {
     Row(Modifier.fillMaxSize()) {
         WorkspaceSidebar(
@@ -1202,6 +2089,7 @@ private fun WideChatLayout(args: ChatLayoutArgs) {
                 reactionsByMessageId = args.reactionsByMessageId,
                 displayedByMessageId = args.displayedByMessageId,
                 linkPreviews = args.linkPreviews,
+                replyCountsByRootKey = remember(args.messages) { args.messages.threadMetaByRoot() },
                 modifier = Modifier.weight(1f),
                 onLoadOlder = args.onLoadOlder,
                 onDisplayed = args.onDisplayed,
@@ -1209,6 +2097,7 @@ private fun WideChatLayout(args: ChatLayoutArgs) {
                 onReact = args.onReact,
                 onRetract = args.onRetract,
                 onStartReply = args.onStartReply,
+                onOpenThread = args.onOpenThread,
                 onRequestLinkPreview = args.onRequestLinkPreview,
             )
             Composer(
@@ -1219,10 +2108,12 @@ private fun WideChatLayout(args: ChatLayoutArgs) {
                 initialText = args.draftText,
                 replyPreview = args.replyPreview,
                 mentionSuggestions = args.mentionSuggestions,
+                forumTopicMode = args.currentChannel?.channelType == "forum",
                 onTextChanged = args.onDraftChange,
                 onClearReply = args.onClearReply,
                 onTyping = args.onTyping,
                 onSend = args.onSend,
+                onSendTopic = args.onSendForumTopic,
                 onAttachmentPicked = args.onAttachmentPicked,
             )
         }
@@ -1542,6 +2433,7 @@ private fun Timeline(
     reactionsByMessageId: Map<String, List<ReactionSummary>>,
     displayedByMessageId: Map<String, DeliverySummary>,
     linkPreviews: Map<String, social.waddle.android.data.LinkPreview>,
+    replyCountsByRootKey: Map<String, ThreadMeta>,
     modifier: Modifier = Modifier,
     onLoadOlder: () -> Unit,
     onDisplayed: (String) -> Unit,
@@ -1549,10 +2441,27 @@ private fun Timeline(
     onReact: (String, String) -> Unit,
     onRetract: (String) -> Unit,
     onStartReply: (MessageEntity) -> Unit,
+    onOpenThread: (String) -> Unit,
     onRequestLinkPreview: (String) -> Unit,
 ) {
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
+    var flashKey by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(flashKey) {
+        if (flashKey != null) {
+            kotlinx.coroutines.delay(FLASH_DURATION_MILLIS)
+            flashKey = null
+        }
+    }
+    val navigateToMessage: (String) -> Unit = { key ->
+        val index = messages.indexOfFirst { it.matchesReference(key) }
+        if (index >= 0) {
+            scope.launch {
+                listState.animateScrollToItem(index)
+                flashKey = key
+            }
+        }
+    }
     val atBottom by remember {
         derivedStateOf {
             val lastVisible =
@@ -1579,11 +2488,15 @@ private fun Timeline(
             displayedByMessageId = displayedByMessageId,
             session = session,
             linkPreviews = linkPreviews,
+            replyCountsByRootKey = replyCountsByRootKey,
+            flashKey = flashKey,
             onLoadOlder = onLoadOlder,
             onEdit = onEdit,
             onReact = onReact,
             onRetract = onRetract,
             onStartReply = onStartReply,
+            onOpenThread = onOpenThread,
+            onNavigateToMessage = navigateToMessage,
             onRequestLinkPreview = onRequestLinkPreview,
         )
         if (!atBottom && messages.isNotEmpty()) {
@@ -1594,6 +2507,8 @@ private fun Timeline(
         }
     }
 }
+
+private const val FLASH_DURATION_MILLIS = 900L
 
 @Composable
 private fun TimelineAutoScrollEffects(
@@ -1623,17 +2538,30 @@ private fun TimelinePullRefreshList(
     displayedByMessageId: Map<String, DeliverySummary>,
     session: AuthSession,
     linkPreviews: Map<String, social.waddle.android.data.LinkPreview>,
+    replyCountsByRootKey: Map<String, ThreadMeta>,
+    flashKey: String?,
     onLoadOlder: () -> Unit,
     onEdit: (String, String) -> Unit,
     onReact: (String, String) -> Unit,
     onRetract: (String) -> Unit,
     onStartReply: (MessageEntity) -> Unit,
+    onOpenThread: (String) -> Unit,
+    onNavigateToMessage: (String) -> Unit,
     onRequestLinkPreview: (String) -> Unit,
 ) {
     var pullRefreshing by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     val pullState = rememberPullToRefreshState()
-    val parentLookup = remember(messages) { messages.associateBy { it.serverId ?: it.id } }
+    val parentLookup =
+        remember(messages) {
+            buildMap {
+                for (message in messages) {
+                    put(message.id, message)
+                    message.serverId?.let { put(it, message) }
+                    message.originStanzaId?.let { put(it, message) }
+                }
+            }
+        }
     PullToRefreshBox(
         isRefreshing = pullRefreshing,
         onRefresh = {
@@ -1666,10 +2594,14 @@ private fun TimelinePullRefreshList(
                     displayedByMessageId = displayedByMessageId,
                     session = session,
                     linkPreviews = linkPreviews,
+                    threadMeta = replyCountsByRootKey[message.threadKey],
+                    flashed = flashKey != null && message.matchesReference(flashKey),
                     onEdit = onEdit,
                     onReact = onReact,
                     onRetract = onRetract,
                     onStartReply = onStartReply,
+                    onOpenThread = onOpenThread,
+                    onNavigateToMessage = onNavigateToMessage,
                     onRequestLinkPreview = onRequestLinkPreview,
                 )
             }
@@ -1685,15 +2617,20 @@ private fun TimelineMessageItem(
     displayedByMessageId: Map<String, DeliverySummary>,
     session: AuthSession,
     linkPreviews: Map<String, social.waddle.android.data.LinkPreview>,
+    threadMeta: ThreadMeta?,
+    flashed: Boolean,
     onEdit: (String, String) -> Unit,
     onReact: (String, String) -> Unit,
     onRetract: (String) -> Unit,
     onStartReply: (MessageEntity) -> Unit,
+    onOpenThread: (String) -> Unit,
+    onNavigateToMessage: (String) -> Unit,
     onRequestLinkPreview: (String) -> Unit,
 ) {
     val messageReactions =
         reactionsByMessageId[message.id].orEmpty() +
-            reactionsByMessageId[message.serverId].orEmpty()
+            reactionsByMessageId[message.serverId].orEmpty() +
+            reactionsByMessageId[message.originStanzaId].orEmpty()
     val parent = message.replyToMessageId?.let { parentLookup[it] }
     MessageRow(
         session = session,
@@ -1703,14 +2640,21 @@ private fun TimelineMessageItem(
         displayedCount =
             displayedByMessageId[message.id]?.count
                 ?: message.serverId?.let { displayedByMessageId[it]?.count }
+                ?: message.originStanzaId?.let { displayedByMessageId[it]?.count }
                 ?: 0,
         own = message.senderId == session.stored.userId,
         linkPreviews = linkPreviews,
-        onEdit = { body -> onEdit(message.messageKey, body) },
-        onReact = { emoji -> onReact(message.messageKey, emoji) },
-        onRetract = { onRetract(message.messageKey) },
+        threadMeta = threadMeta,
+        // Groupchat wire references use [threadKey], which prefers the
+        // room-assigned stanza-id when available.
+        onEdit = { body -> onEdit(message.threadKey, body) },
+        onReact = { emoji -> onReact(message.threadKey, emoji) },
+        onRetract = { onRetract(message.threadKey) },
         onStartReply = { onStartReply(message) },
+        onOpenThread = { onOpenThread(message.threadKey) },
         onRequestLinkPreview = onRequestLinkPreview,
+        flashed = flashed,
+        onNavigateToMessage = onNavigateToMessage,
     )
 }
 
@@ -1732,27 +2676,101 @@ private fun JumpToLatestButton(
 
 private const val PULL_REFRESH_LINGER_MILLIS = 600L
 
+/**
+ * Slim single-line reply chip: `↳ @alice "their message"`. Matches the
+ * chat/ frontend's compact style — it doesn't push the reply text around
+ * or take 2+ lines of vertical room. Tap → scroll to (and flash) the
+ * parent if it's in the loaded window.
+ */
 @Composable
-private fun QuotedParent(parent: MessageEntity) {
-    Surface(
-        color = MaterialTheme.colorScheme.surfaceVariant,
-        contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
-        shape = RoundedCornerShape(8.dp),
-        modifier = Modifier.padding(bottom = 6.dp),
+private fun QuotedParent(
+    parent: MessageEntity,
+    onClick: (() -> Unit)? = null,
+) {
+    val colors = LocalWaddleColors.current
+    val senderName = parent.senderName ?: "unknown"
+    val preview =
+        remember(parent.body) {
+            parent.body
+                .lineSequence()
+                .firstOrNull()
+                ?.trim()
+                .orEmpty()
+        }
+    ReplyChip(
+        icon = Icons.AutoMirrored.Filled.Reply,
+        onClick = onClick,
     ) {
-        Column(modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)) {
+        Text(
+            text = "@$senderName",
+            style = MaterialTheme.typography.labelMedium,
+            fontWeight = FontWeight.SemiBold,
+            color = MaterialTheme.colorScheme.primary,
+        )
+        if (preview.isNotBlank()) {
             Text(
-                text = parent.senderName ?: "unknown",
-                style = MaterialTheme.typography.labelSmall,
-                fontWeight = FontWeight.SemiBold,
-            )
-            Text(
-                text = parent.body,
-                style = MaterialTheme.typography.bodySmall,
-                maxLines = 2,
+                text = preview,
+                style = MaterialTheme.typography.labelMedium,
+                color = colors.sidebarMuted,
+                maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f, fill = false),
             )
         }
+    }
+}
+
+/**
+ * Same chip shape as [QuotedParent] but for replies whose parent is not
+ * in the currently-loaded message window. Tapping still scrolls if the
+ * parent gets loaded later, but we can't preview the body yet.
+ */
+@Composable
+private fun UnresolvedReplyChip(onClick: () -> Unit) {
+    val colors = LocalWaddleColors.current
+    ReplyChip(
+        icon = Icons.AutoMirrored.Filled.Reply,
+        onClick = onClick,
+    ) {
+        Text(
+            text = "Replying to earlier message",
+            style = MaterialTheme.typography.labelMedium,
+            color = colors.sidebarMuted,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
+}
+
+/**
+ * Shared layout for the compact reply/quote chip: a single horizontal row
+ * with a `↳` icon, a small horizontal gap, and the caller's content.
+ * Rendered in the muted foreground color so it reads as metadata, not
+ * another message bubble.
+ */
+@Composable
+private fun ReplyChip(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    onClick: (() -> Unit)?,
+    content: @Composable RowScope.() -> Unit,
+) {
+    val colors = LocalWaddleColors.current
+    Row(
+        modifier =
+            Modifier
+                .padding(bottom = 2.dp)
+                .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
+                .padding(vertical = 2.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        Icon(
+            imageVector = icon,
+            contentDescription = null,
+            tint = colors.sidebarMuted,
+            modifier = Modifier.size(14.dp),
+        )
+        content()
     }
 }
 
@@ -1765,11 +2783,15 @@ private fun MessageRow(
     displayedCount: Int,
     own: Boolean,
     linkPreviews: Map<String, social.waddle.android.data.LinkPreview>,
+    threadMeta: ThreadMeta?,
     onEdit: (String) -> Unit,
     onReact: (String) -> Unit,
     onRetract: () -> Unit,
     onStartReply: () -> Unit,
+    onOpenThread: () -> Unit,
     onRequestLinkPreview: (String) -> Unit,
+    flashed: Boolean = false,
+    onNavigateToMessage: (String) -> Unit = {},
 ) {
     var editing by rememberSaveable(message.id) { mutableStateOf(false) }
     var editBody by rememberSaveable(message.id) { mutableStateOf(message.body) }
@@ -1786,59 +2808,194 @@ private fun MessageRow(
         return
     }
 
+    var actionsOpen by remember(message.id) { mutableStateOf(false) }
+    val context = LocalContext.current
+    MessageRowBody(
+        message = message,
+        parentMessage = parentMessage,
+        reactions = reactions,
+        displayedCount = displayedCount,
+        own = own,
+        mentioned = mentioned,
+        flashed = flashed,
+        linkPreviews = linkPreviews,
+        threadMeta = threadMeta,
+        editing = editing,
+        editBody = editBody,
+        onEditBodyChange = { editBody = it },
+        onSaveEdit = {
+            val trimmed = editBody.trim()
+            if (trimmed.isNotEmpty() && trimmed != message.body) onEdit(trimmed)
+            editing = false
+        },
+        onCancelEdit = {
+            editBody = message.body
+            editing = false
+        },
+        onLongPress = { actionsOpen = true },
+        onStartReply = onStartReply,
+        onReact = onReact,
+        onOpenThread = onOpenThread,
+        onRequestLinkPreview = onRequestLinkPreview,
+        onNavigateToMessage = onNavigateToMessage,
+    )
+
+    if (actionsOpen) {
+        MessageActionSheetFor(
+            own = own,
+            messageBody = message.body,
+            onDismiss = { actionsOpen = false },
+            context = context,
+            onReact = onReact,
+            onStartReply = onStartReply,
+            onStartEdit = { editing = true },
+            onRetract = onRetract,
+        )
+    }
+}
+
+@Composable
+private fun MessageActionSheetFor(
+    own: Boolean,
+    messageBody: String,
+    context: android.content.Context,
+    onDismiss: () -> Unit,
+    onReact: (String) -> Unit,
+    onStartReply: () -> Unit,
+    onStartEdit: () -> Unit,
+    onRetract: () -> Unit,
+) {
+    fun andClose(action: () -> Unit): () -> Unit =
+        {
+            action()
+            onDismiss()
+        }
+    MessageActionSheet(
+        own = own,
+        onDismiss = onDismiss,
+        onReact = { emoji ->
+            onReact(emoji)
+            onDismiss()
+        },
+        onReply = andClose(onStartReply),
+        onCopy = andClose { copyToClipboard(context, messageBody) },
+        onEdit = andClose(onStartEdit),
+        onRetract = andClose(onRetract),
+    )
+}
+
+@Composable
+private fun MessageContent(
+    message: MessageEntity,
+    linkPreviews: Map<String, social.waddle.android.data.LinkPreview>,
+    onRequestLinkPreview: (String) -> Unit,
+) {
+    message.forumTopicTitle?.takeIf(String::isNotBlank)?.let { title ->
+        Text(
+            text = title,
+            style = MaterialTheme.typography.titleSmall,
+            fontWeight = FontWeight.SemiBold,
+            modifier = Modifier.padding(bottom = 2.dp),
+        )
+    }
+    // If the entire body is a GIF URL we render it inline below via
+    // MessageExtras — skip the redundant plain-text link above.
+    val trimmedBody = remember(message.body) { message.body.trim() }
+    val bodyIsGifOnly =
+        message.sharedFileUrl == null && isWebUrl(trimmedBody) && isAnimatedImageUrl(trimmedBody)
+    if (!bodyIsGifOnly && message.body.isNotBlank()) {
+        MessageBody(body = message.body)
+    }
+    val previewUrl = remember(message.body) { firstWebUrl(message.body) }
+    MessageExtras(
+        message = message,
+        linkPreview = previewUrl?.let { linkPreviews[it] },
+        onRequestLinkPreview = onRequestLinkPreview,
+    )
+}
+
+/**
+ * Slack-inspired thread chip — small participant avatars on the left, reply
+ * count + "last reply X ago" on the right. Provides social signal, not just
+ * a number, so users can tell threads apart at a glance.
+ */
+@Composable
+private fun ThreadChip(
+    meta: ThreadMeta,
+    onClick: () -> Unit,
+) {
+    val colors = LocalWaddleColors.current
+    val accent = MaterialTheme.colorScheme.primary
+    val countText = if (meta.count == 1) "1 reply" else "${meta.count} replies"
+    val lastReply = remember(meta.lastReplyAt) { meta.lastReplyAt?.let(::formatRelativeTimestamp) }
     Row(
         modifier =
             Modifier
-                .fillMaxWidth()
-                .then(
-                    if (mentioned) {
-                        Modifier.background(MaterialTheme.colorScheme.tertiaryContainer, RoundedCornerShape(8.dp))
-                    } else {
-                        Modifier
-                    },
-                ).padding(horizontal = 4.dp, vertical = 6.dp),
-        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                .padding(top = 6.dp)
+                .clickable(onClick = onClick)
+                .padding(vertical = 2.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        AvatarInitial(name = message.senderName)
-        Column(Modifier.weight(1f)) {
-            MessageMeta(message = message, own = own, displayedCount = displayedCount)
-            Spacer(Modifier.height(4.dp))
-            if (editing) {
-                EditMessageForm(
-                    body = editBody,
-                    onBodyChange = { editBody = it },
-                    onSave = {
-                        val trimmed = editBody.trim()
-                        if (trimmed.isNotEmpty() && trimmed != message.body) {
-                            onEdit(trimmed)
-                        }
-                        editing = false
-                    },
-                    onCancel = {
-                        editBody = message.body
-                        editing = false
-                    },
-                )
-            } else {
-                parentMessage?.let { QuotedParent(it) }
-                MessageBody(body = message.body)
-                val previewUrl = remember(message.body) { firstWebUrl(message.body) }
-                MessageExtras(
-                    message = message,
-                    linkPreview = previewUrl?.let { linkPreviews[it] },
-                    onRequestLinkPreview = onRequestLinkPreview,
-                )
-                ReactionStrip(reactions = reactions, onReact = onReact)
-                MessageActionRow(
-                    own = own,
-                    pending = message.pending,
-                    onStartEdit = { editing = true },
-                    onStartReply = onStartReply,
-                    onReact = onReact,
-                    onRetract = onRetract,
+        ThreadParticipantStack(names = meta.participantNames)
+        Text(
+            text = countText,
+            style = MaterialTheme.typography.labelMedium,
+            fontWeight = FontWeight.SemiBold,
+            color = accent,
+        )
+        lastReply?.let {
+            Text(
+                text = "Last reply $it",
+                style = MaterialTheme.typography.labelSmall,
+                color = colors.sidebarMuted,
+            )
+        }
+    }
+}
+
+@Composable
+private fun ThreadParticipantStack(names: List<String>) {
+    if (names.isEmpty()) return
+    val avatarSize = 20.dp
+    val overlap = 6.dp
+    Row {
+        names.forEachIndexed { index, name ->
+            Box(
+                modifier =
+                    Modifier
+                        .offset(x = -(overlap * index))
+                        .size(avatarSize)
+                        .background(waddleSummaryAccent(name), CircleShape)
+                        .padding(1.dp)
+                        .background(waddleSummaryAccent(name), CircleShape),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    text = name.firstOrNull()?.uppercaseChar()?.toString() ?: "?",
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.Bold,
+                    color = Color.White,
+                    fontSize = 10.sp,
                 )
             }
         }
+    }
+}
+
+/**
+ * ISO-8601 → "2m", "3h", "5d", or "just now". Kept terse so the chip stays
+ * compact. Falls back to empty string on parse failure.
+ */
+private fun formatRelativeTimestamp(iso: String): String? {
+    val instant = runCatching { Instant.parse(iso) }.getOrNull() ?: return null
+    val diffMillis = System.currentTimeMillis() - instant.toEpochMilli()
+    val minutes = diffMillis / 60_000
+    return when {
+        minutes < 1 -> "just now"
+        minutes < 60 -> "${minutes}m ago"
+        minutes < 60 * 24 -> "${minutes / 60}h ago"
+        else -> "${minutes / (60 * 24)}d ago"
     }
 }
 
@@ -1891,12 +3048,32 @@ private fun MessageExtras(
     if (message.sharedFileUrl == null && !message.isSticker) {
         val firstUrl = remember(message.body) { firstWebUrl(message.body) }
         if (firstUrl != null) {
-            LaunchedEffect(firstUrl) { onRequestLinkPreview(firstUrl) }
-            linkPreview?.let { preview ->
-                LinkPreviewCard(preview = preview, onOpen = { uriHandler.openUri(firstUrl) })
+            if (isAnimatedImageUrl(firstUrl)) {
+                // GIF / animated image: render inline via Coil's animated
+                // decoder instead of showing a naked link.
+                InlineImageAttachment(
+                    url = firstUrl,
+                    description = "Animated image",
+                    onOpen = { uriHandler.openUri(firstUrl) },
+                )
+            } else {
+                LaunchedEffect(firstUrl) { onRequestLinkPreview(firstUrl) }
+                linkPreview?.let { preview ->
+                    LinkPreviewCard(preview = preview, onOpen = { uriHandler.openUri(firstUrl) })
+                }
             }
         }
     }
+}
+
+/**
+ * Returns true when [url]'s path ends with `.gif` (query string and fragment
+ * stripped first). We render these inline via Coil's animated decoder instead
+ * of showing a naked link.
+ */
+private fun isAnimatedImageUrl(url: String): Boolean {
+    val path = url.substringBefore('?').substringBefore('#').lowercase()
+    return path.endsWith(".gif")
 }
 
 @Composable
@@ -1972,12 +3149,17 @@ private fun InlineImageAttachment(
     description: String?,
     onOpen: () -> Unit,
 ) {
+    val lightbox = LocalLightbox.current
+    // Prefer the lightbox controller when one is installed so taps open
+    // in-app; fall back to the caller's handler (e.g. external browser)
+    // for contexts outside of chat screens.
+    val handleTap: () -> Unit = { lightbox?.open(url) ?: onOpen() }
     Surface(
         modifier =
             Modifier
                 .padding(top = 6.dp)
                 .fillMaxWidth(fraction = 0.8f)
-                .clickable(onClick = onOpen),
+                .clickable(onClick = handleTap),
         shape = RoundedCornerShape(12.dp),
         color = MaterialTheme.colorScheme.surfaceVariant,
     ) {
@@ -2047,6 +3229,7 @@ private fun MessageMeta(
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
         )
+        parseHats(message.hats).forEach { hat -> HatBadge(hat = hat) }
         Text(
             text = formatMessageStamp(message.createdAt),
             style = MaterialTheme.typography.labelSmall,
@@ -2123,44 +3306,268 @@ private fun ReactionStrip(
     }
 }
 
+/**
+ * Renders the body of a message row (avatar + column with edit/display
+ * branch). Extracted so [MessageRow] stays short enough to pass detekt's
+ * complexity caps.
+ */
+@Suppress("LongParameterList")
 @Composable
-private fun MessageActionRow(
+private fun MessageRowBody(
+    message: MessageEntity,
+    parentMessage: MessageEntity?,
+    reactions: List<ReactionSummary>,
+    displayedCount: Int,
     own: Boolean,
-    pending: Boolean,
-    onStartEdit: () -> Unit,
+    mentioned: Boolean,
+    flashed: Boolean,
+    linkPreviews: Map<String, social.waddle.android.data.LinkPreview>,
+    threadMeta: ThreadMeta?,
+    editing: Boolean,
+    editBody: String,
+    onEditBodyChange: (String) -> Unit,
+    onSaveEdit: () -> Unit,
+    onCancelEdit: () -> Unit,
+    onLongPress: () -> Unit,
     onStartReply: () -> Unit,
     onReact: (String) -> Unit,
-    onRetract: () -> Unit,
+    onOpenThread: () -> Unit,
+    onRequestLinkPreview: (String) -> Unit,
+    onNavigateToMessage: (String) -> Unit,
 ) {
-    Row(
-        modifier = Modifier.padding(top = 6.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(2.dp),
-    ) {
-        QUICK_REACTIONS.forEach { emoji ->
-            TextButton(
-                onClick = { onReact(emoji) },
-                enabled = !pending,
-                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
-            ) {
-                Text(emoji)
+    val haptics = androidx.compose.ui.platform.LocalHapticFeedback.current
+    val background =
+        when {
+            flashed -> MaterialTheme.colorScheme.primary.copy(alpha = 0.14f)
+            mentioned -> MaterialTheme.colorScheme.tertiaryContainer
+            else -> Color.Transparent
+        }
+    SwipeToReplyRow(enabled = !message.pending, onTriggered = onStartReply) {
+        Row(
+            modifier =
+                Modifier
+                    .fillMaxWidth()
+                    .background(background, RoundedCornerShape(8.dp))
+                    .pointerInput(message.id) {
+                        detectTapGestures(
+                            onLongPress = {
+                                if (!message.pending) {
+                                    haptics.performHapticFeedback(
+                                        androidx.compose.ui.hapticfeedback.HapticFeedbackType.LongPress,
+                                    )
+                                    onLongPress()
+                                }
+                            },
+                        )
+                    }.padding(horizontal = 4.dp, vertical = 6.dp),
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            AvatarInitial(name = message.senderName)
+            Column(Modifier.weight(1f)) {
+                MessageMeta(message = message, own = own, displayedCount = displayedCount)
+                Spacer(Modifier.height(4.dp))
+                if (editing) {
+                    EditMessageForm(
+                        body = editBody,
+                        onBodyChange = onEditBodyChange,
+                        onSave = onSaveEdit,
+                        onCancel = onCancelEdit,
+                    )
+                } else {
+                    when {
+                        parentMessage != null -> {
+                            QuotedParent(
+                                parent = parentMessage,
+                                onClick = { onNavigateToMessage(parentMessage.messageKey) },
+                            )
+                        }
+
+                        message.replyToMessageId != null -> {
+                            // Reply target is outside the loaded window — still
+                            // show a slim chip so the reply relationship is
+                            // visible, even without the parent body preview.
+                            UnresolvedReplyChip(onClick = { onNavigateToMessage(message.replyToMessageId) })
+                        }
+                    }
+                    MessageContent(
+                        message = message,
+                        linkPreviews = linkPreviews,
+                        onRequestLinkPreview = onRequestLinkPreview,
+                    )
+                    ReactionStrip(reactions = reactions, onReact = onReact)
+                    threadMeta?.takeIf { it.count > 0 }?.let { meta ->
+                        ThreadChip(meta = meta, onClick = onOpenThread)
+                    }
+                }
             }
         }
-        IconButton(onClick = onStartReply, enabled = !pending) {
+    }
+}
+
+/**
+ * Swipe-right-to-reply wrapper — WhatsApp / Signal / Telegram staple. The
+ * user drags the message row horizontally; past [REPLY_THRESHOLD_DP] we fire
+ * [onTriggered] (with haptic) and snap back. A reply-arrow icon fades in on
+ * the left as the drag progresses so the gesture is discoverable.
+ */
+@Composable
+private fun SwipeToReplyRow(
+    enabled: Boolean,
+    onTriggered: () -> Unit,
+    content: @Composable () -> Unit,
+) {
+    val haptics = androidx.compose.ui.platform.LocalHapticFeedback.current
+    val density = LocalDensity.current
+    val thresholdPx = with(density) { REPLY_THRESHOLD_DP.dp.toPx() }
+    val maxDragPx = thresholdPx * 1.4f
+    val dragX = remember { Animatable(0f) }
+    val scope = rememberCoroutineScope()
+    var hapticFired by remember { mutableStateOf(false) }
+    val progress = (dragX.value / thresholdPx).coerceIn(0f, 1f)
+    val colors = LocalWaddleColors.current
+    Box(modifier = Modifier.fillMaxWidth()) {
+        // Background reveal: reply arrow slides in as the drag progresses.
+        Row(
+            modifier =
+                Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
             Icon(
                 imageVector = Icons.AutoMirrored.Filled.Reply,
-                contentDescription = "Reply",
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.primary.copy(alpha = progress),
+                modifier = Modifier.size(20.dp),
             )
         }
-        Spacer(Modifier.weight(1f))
-        if (own) {
-            IconButton(onClick = onStartEdit, enabled = !pending) {
-                Icon(Icons.Rounded.Edit, contentDescription = "Edit message")
-            }
-            IconButton(onClick = onRetract, enabled = !pending) {
-                Icon(Icons.Rounded.Delete, contentDescription = "Delete message")
+        Box(
+            modifier =
+                Modifier
+                    .fillMaxWidth()
+                    .offset { IntOffset(dragX.value.toInt(), 0) }
+                    .pointerInput(enabled) {
+                        if (!enabled) return@pointerInput
+                        detectHorizontalDragGestures(
+                            onDragEnd = {
+                                val crossed = dragX.value >= thresholdPx
+                                scope.launch { dragX.animateTo(0f) }
+                                hapticFired = false
+                                if (crossed) onTriggered()
+                            },
+                            onDragCancel = {
+                                scope.launch { dragX.animateTo(0f) }
+                                hapticFired = false
+                            },
+                            onHorizontalDrag = { change, delta ->
+                                change.consume()
+                                // Right-only: negative drags are ignored.
+                                val next = (dragX.value + delta).coerceIn(0f, maxDragPx)
+                                scope.launch { dragX.snapTo(next) }
+                                if (!hapticFired && next >= thresholdPx) {
+                                    haptics.performHapticFeedback(
+                                        androidx.compose.ui.hapticfeedback.HapticFeedbackType.LongPress,
+                                    )
+                                    hapticFired = true
+                                }
+                            },
+                        )
+                    }.then(
+                        if (progress > 0f) {
+                            Modifier.background(colors.composerSurface)
+                        } else {
+                            Modifier
+                        },
+                    ),
+        ) {
+            content()
+        }
+    }
+}
+
+private const val REPLY_THRESHOLD_DP = 64
+
+/**
+ * Long-press action sheet for a message. Mirrors the iMessage / WhatsApp /
+ * Telegram pattern: a quick reactions row across the top, then the full
+ * action list below (reply, copy, and for own messages edit + delete).
+ * Hides the perma-visible per-message buttons so the timeline stays calm.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun MessageActionSheet(
+    own: Boolean,
+    onDismiss: () -> Unit,
+    onReact: (String) -> Unit,
+    onReply: () -> Unit,
+    onCopy: () -> Unit,
+    onEdit: () -> Unit,
+    onRetract: () -> Unit,
+) {
+    androidx.compose.material3.ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        containerColor = MaterialTheme.colorScheme.surface,
+    ) {
+        Row(
+            modifier =
+                Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 8.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            QUICK_REACTIONS.forEach { emoji ->
+                Box(
+                    modifier =
+                        Modifier
+                            .size(44.dp)
+                            .clickable { onReact(emoji) },
+                    contentAlignment = Alignment.CenterVertically.let { Alignment.Center },
+                ) {
+                    Text(text = emoji, style = MaterialTheme.typography.headlineSmall)
+                }
             }
         }
+        HorizontalDivider(color = LocalWaddleColors.current.divider)
+        MessageActionItem(icon = Icons.AutoMirrored.Filled.Reply, label = "Reply", onClick = onReply)
+        MessageActionItem(
+            icon = Icons.Rounded.ContentCopy,
+            label = "Copy text",
+            onClick = onCopy,
+        )
+        if (own) {
+            MessageActionItem(icon = Icons.Rounded.Edit, label = "Edit", onClick = onEdit)
+            MessageActionItem(
+                icon = Icons.Rounded.Delete,
+                label = "Delete",
+                onClick = onRetract,
+                destructive = true,
+            )
+        }
+        Spacer(Modifier.height(8.dp))
+    }
+}
+
+@Composable
+private fun MessageActionItem(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    label: String,
+    onClick: () -> Unit,
+    destructive: Boolean = false,
+) {
+    val tint =
+        if (destructive) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface
+    Row(
+        modifier =
+            Modifier
+                .fillMaxWidth()
+                .clickable(onClick = onClick)
+                .padding(horizontal = 20.dp, vertical = 14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(16.dp),
+    ) {
+        Icon(imageVector = icon, contentDescription = null, tint = tint, modifier = Modifier.size(20.dp))
+        Text(text = label, style = MaterialTheme.typography.bodyLarge, color = tint)
     }
 }
 
@@ -2200,10 +3607,12 @@ private fun Composer(
     initialText: String,
     replyPreview: ReplyPreview?,
     mentionSuggestions: List<String> = emptyList(),
+    forumTopicMode: Boolean = false,
     onTextChanged: (String) -> Unit,
     onClearReply: () -> Unit,
     onTyping: (Boolean) -> Unit,
     onSend: (String) -> Unit,
+    onSendTopic: (title: String, body: String) -> Unit = { _, _ -> },
     onAttachmentPicked: (Uri, String?, String?) -> Unit,
 ) {
     // Key on conversationKey (channelId or peerJid) — NOT initialText — so the
@@ -2211,38 +3620,32 @@ private fun Composer(
     // race the user's keystrokes. initialText is only consulted when the
     // conversation first loads its draft (see LaunchedEffect below).
     var body by rememberSaveable(conversationKey) { mutableStateOf(initialText) }
+    var topicTitle by rememberSaveable(conversationKey) { mutableStateOf("") }
     var composing by rememberSaveable(conversationKey) { mutableStateOf(false) }
     LaunchedEffect(conversationKey, initialText) {
         if (body.isEmpty() && initialText.isNotEmpty()) {
             body = initialText
         }
     }
-    val placeholder = channelName?.let { "Message #$it" } ?: "Message"
     val mentionToken = remember(body) { trailingMentionToken(body) }
     val filteredMentions = filteredMentionsFor(mentionToken, mentionSuggestions)
     val state =
-        ComposerState(
+        buildComposerState(
             body = body,
             composing = composing,
             enabled = enabled,
             sending = sending,
-            placeholder = placeholder,
-            onBodyChange = { next ->
-                body = next
-                onTextChanged(next)
-                val nextComposing = next.isNotBlank()
-                if (nextComposing != composing) {
-                    composing = nextComposing
-                    onTyping(nextComposing)
-                }
-            },
-            onSend = { trimmed ->
-                onSend(trimmed)
-                body = ""
-                if (composing) {
-                    composing = false
-                    onTyping(false)
-                }
+            channelName = channelName,
+            forumTopicMode = forumTopicMode,
+            topicTitle = topicTitle,
+            onBodyUpdate = { next -> body = next },
+            onComposingUpdate = { next -> composing = next },
+            onTextChanged = onTextChanged,
+            onTyping = onTyping,
+            onSend = onSend,
+            onSendTopic = { title, b ->
+                onSendTopic(title, b)
+                topicTitle = ""
             },
         )
 
@@ -2257,9 +3660,80 @@ private fun Composer(
                 },
             )
         }
+        if (forumTopicMode) {
+            ForumTopicTitleField(title = topicTitle, onChange = { topicTitle = it }, enabled = enabled && !sending)
+        }
         replyPreview?.let { ReplyPreviewCard(preview = it, onClose = onClearReply) }
         ComposerRow(state = state, onAttachmentPicked = onAttachmentPicked)
     }
+}
+
+@Suppress("LongParameterList")
+private fun buildComposerState(
+    body: String,
+    composing: Boolean,
+    enabled: Boolean,
+    sending: Boolean,
+    channelName: String?,
+    forumTopicMode: Boolean,
+    topicTitle: String,
+    onBodyUpdate: (String) -> Unit,
+    onComposingUpdate: (Boolean) -> Unit,
+    onTextChanged: (String) -> Unit,
+    onTyping: (Boolean) -> Unit,
+    onSend: (String) -> Unit,
+    onSendTopic: (String, String) -> Unit,
+): ComposerState {
+    val placeholder =
+        when {
+            forumTopicMode -> "Write the opening post"
+            channelName != null -> "Message #$channelName"
+            else -> "Message"
+        }
+    return ComposerState(
+        body = body,
+        composing = composing,
+        enabled = enabled && (!forumTopicMode || topicTitle.isNotBlank()),
+        sending = sending,
+        placeholder = placeholder,
+        onBodyChange = { next ->
+            onBodyUpdate(next)
+            onTextChanged(next)
+            val nextComposing = next.isNotBlank()
+            if (nextComposing != composing) {
+                onComposingUpdate(nextComposing)
+                onTyping(nextComposing)
+            }
+        },
+        onSend = { trimmed ->
+            if (forumTopicMode) {
+                onSendTopic(topicTitle.trim(), trimmed)
+            } else {
+                onSend(trimmed)
+            }
+            onBodyUpdate("")
+            if (composing) {
+                onComposingUpdate(false)
+                onTyping(false)
+            }
+        },
+    )
+}
+
+@Composable
+private fun ForumTopicTitleField(
+    title: String,
+    onChange: (String) -> Unit,
+    enabled: Boolean,
+) {
+    OutlinedTextField(
+        value = title,
+        onValueChange = onChange,
+        enabled = enabled,
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+        singleLine = true,
+        placeholder = { Text("Topic title") },
+    )
 }
 
 private data class ComposerState(
@@ -2286,6 +3760,11 @@ private fun filteredMentionsFor(
             }.orEmpty()
     }
 
+/**
+ * Pill-shaped chat composer matching the design: a rounded container holding
+ * an attach chip, the text field, and a send chip that lights up only when
+ * the body is non-blank. No formatting toolbar — plain text input only.
+ */
 @Composable
 private fun ComposerRow(
     state: ComposerState,
@@ -2293,6 +3772,7 @@ private fun ComposerRow(
 ) {
     val context = LocalContext.current
     val haptics = androidx.compose.ui.platform.LocalHapticFeedback.current
+    val colors = LocalWaddleColors.current
     val attachmentLauncher =
         rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
             if (uri != null) {
@@ -2301,38 +3781,97 @@ private fun ComposerRow(
             }
         }
     val ready = state.enabled && !state.sending
-    Row(
-        modifier = Modifier.fillMaxWidth().padding(12.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    val canSend = ready && state.body.isNotBlank()
+    val sendAction: () -> Unit = {
+        val trimmed = state.body.trim()
+        if (trimmed.isNotEmpty()) {
+            haptics.performHapticFeedback(
+                androidx.compose.ui.hapticfeedback.HapticFeedbackType.LongPress,
+            )
+            state.onSend(trimmed)
+        }
+    }
+    Surface(
+        color = colors.composerSurface,
+        shape = RoundedCornerShape(22.dp),
+        modifier =
+            Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 10.dp),
     ) {
-        OutlinedTextField(
-            value = state.body,
-            onValueChange = state.onBodyChange,
-            enabled = ready,
-            modifier = Modifier.weight(1f),
-            placeholder = { Text(state.placeholder) },
-            maxLines = 5,
-        )
-        IconButton(
-            onClick = { attachmentLauncher.launch(arrayOf("*/*")) },
-            enabled = ready,
+        Row(
+            modifier = Modifier.padding(start = 6.dp, end = 6.dp, top = 4.dp, bottom = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
         ) {
-            Icon(Icons.Rounded.AttachFile, contentDescription = "Attach file")
-        }
-        IconButton(
-            onClick = {
-                val trimmed = state.body.trim()
-                if (trimmed.isEmpty()) return@IconButton
-                haptics.performHapticFeedback(
-                    androidx.compose.ui.hapticfeedback.HapticFeedbackType.LongPress,
+            IconButton(
+                onClick = { attachmentLauncher.launch(arrayOf("*/*")) },
+                enabled = ready,
+                modifier = Modifier.size(36.dp),
+            ) {
+                Icon(
+                    imageVector = Icons.Rounded.Add,
+                    contentDescription = "Attach",
+                    tint = colors.sidebarMuted,
                 )
-                state.onSend(trimmed)
-            },
-            enabled = ready && state.body.isNotBlank(),
-        ) {
-            Icon(Icons.AutoMirrored.Rounded.Send, contentDescription = "Send")
+            }
+            BasicTextField(
+                value = state.body,
+                onValueChange = state.onBodyChange,
+                enabled = ready,
+                textStyle =
+                    MaterialTheme.typography.bodyLarge.copy(
+                        color = MaterialTheme.colorScheme.onSurface,
+                    ),
+                cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+                maxLines = 5,
+                modifier =
+                    Modifier
+                        .weight(1f)
+                        .padding(horizontal = 4.dp, vertical = 10.dp),
+                decorationBox = { inner ->
+                    if (state.body.isEmpty()) {
+                        Text(
+                            text = state.placeholder,
+                            style = MaterialTheme.typography.bodyLarge,
+                            color = colors.sidebarMuted,
+                        )
+                    }
+                    inner()
+                },
+            )
+            ComposerSendButton(
+                enabled = canSend,
+                onClick = sendAction,
+            )
         }
+    }
+}
+
+@Composable
+private fun ComposerSendButton(
+    enabled: Boolean,
+    onClick: () -> Unit,
+) {
+    val colors = LocalWaddleColors.current
+    val background =
+        if (enabled) MaterialTheme.colorScheme.primary else Color.Transparent
+    val content =
+        if (enabled) MaterialTheme.colorScheme.onPrimary else colors.sidebarMuted
+    Box(
+        modifier =
+            Modifier
+                .padding(end = 2.dp)
+                .size(36.dp)
+                .background(background, CircleShape)
+                .clickable(enabled = enabled, onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) {
+        Icon(
+            imageVector = Icons.AutoMirrored.Rounded.Send,
+            contentDescription = "Send",
+            tint = content,
+            modifier = Modifier.size(18.dp),
+        )
     }
 }
 
@@ -2408,35 +3947,60 @@ private fun ReplyPreviewCard(
     preview: ReplyPreview,
     onClose: () -> Unit,
 ) {
+    val colors = LocalWaddleColors.current
     Surface(
-        color = MaterialTheme.colorScheme.surfaceVariant,
-        contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
-        shape = RoundedCornerShape(12.dp),
+        color = colors.composerSurface,
+        contentColor = MaterialTheme.colorScheme.onSurface,
+        shape = RoundedCornerShape(10.dp),
         modifier =
             Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 12.dp, vertical = 6.dp),
+                .padding(horizontal = 12.dp, vertical = 4.dp),
     ) {
         Row(
-            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+            modifier = Modifier.height(IntrinsicSize.Min),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            Column(Modifier.weight(1f)) {
-                Text(
-                    text = "Replying to ${preview.senderName}",
-                    style = MaterialTheme.typography.labelMedium,
-                    fontWeight = FontWeight.SemiBold,
-                )
-                Text(
-                    text = preview.body,
-                    style = MaterialTheme.typography.bodySmall,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
-            IconButton(onClick = onClose) {
-                Icon(Icons.Rounded.Close, contentDescription = "Cancel reply")
+            // Accent bar — matches the quoted-parent treatment on messages.
+            Box(
+                modifier =
+                    Modifier
+                        .width(3.dp)
+                        .fillMaxHeight()
+                        .background(MaterialTheme.colorScheme.primary),
+            )
+            Row(
+                modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                AvatarInitial(name = preview.senderName)
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        text = "Replying to ${preview.senderName}",
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                    Text(
+                        text = preview.body,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = colors.sidebarMuted,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+                IconButton(
+                    onClick = onClose,
+                    modifier = Modifier.size(32.dp),
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.Close,
+                        contentDescription = "Cancel reply",
+                        tint = colors.sidebarMuted,
+                        modifier = Modifier.size(18.dp),
+                    )
+                }
             }
         }
     }
@@ -2523,6 +4087,53 @@ private fun EmptyState(text: String) {
 private val MessageEntity.messageKey: String
     get() = serverId ?: id
 
+/** Decodes the MessageEntity.hats column (newline-separated `uri|title` pairs). */
+private fun parseHats(encoded: String?): List<ParsedHat> {
+    if (encoded.isNullOrBlank()) return emptyList()
+    return encoded
+        .lineSequence()
+        .mapNotNull { line ->
+            val sep = line.indexOf('|')
+            if (sep < 0) return@mapNotNull null
+            val uri = line.substring(0, sep).trim().takeIf(String::isNotBlank) ?: return@mapNotNull null
+            val title = line.substring(sep + 1).trim().ifBlank { uri.substringAfterLast(':') }
+            ParsedHat(uri = uri, title = title)
+        }.toList()
+}
+
+private data class ParsedHat(
+    val uri: String,
+    val title: String,
+)
+
+@Composable
+private fun HatBadge(hat: ParsedHat) {
+    val role = hat.uri.substringAfterLast(':').lowercase()
+    val colors = LocalWaddleColors.current
+    val tint =
+        when (role) {
+            "owner" -> Color(0xFFF59E0B)
+            "admin" -> Color(0xFFEF4444)
+            "moderator" -> Color(0xFF3B82F6)
+            "bot" -> Color(0xFF8B5CF6)
+            "verified" -> MaterialTheme.colorScheme.primary
+            else -> colors.sidebarMuted
+        }
+    Surface(
+        color = tint.copy(alpha = 0.14f),
+        contentColor = tint,
+        shape = RoundedCornerShape(999.dp),
+    ) {
+        Text(
+            text = hat.title,
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 1.dp),
+            style = MaterialTheme.typography.labelSmall,
+            fontWeight = FontWeight.SemiBold,
+            maxLines = 1,
+        )
+    }
+}
+
 private fun MessageEntity.mentions(username: String): Boolean =
     (
         mentions
@@ -2580,7 +4191,7 @@ private fun formatMessageStamp(value: String): String =
 
 private val MESSAGE_STAMP_FORMATTER: DateTimeFormatter = DateTimeFormatter.ofPattern("HH:mm")
 private val XEP_0393_INLINE_PATTERN = Regex("(`[^`\\n]+`|\\*[^*\\n]+\\*|~[^~\\n]+~)")
-private val QUICK_REACTIONS = listOf("+1", "❤️", "😂", "🎉", "👀")
+private val QUICK_REACTIONS = listOf("👍", "❤️", "😂", "🎉", "👀")
 private const val TYPING_NAME_LIMIT = 2
 
 /**

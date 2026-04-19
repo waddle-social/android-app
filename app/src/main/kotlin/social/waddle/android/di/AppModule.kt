@@ -68,11 +68,24 @@ object AppModule {
     @Singleton
     fun provideDatabase(
         @ApplicationContext context: Context,
-    ): AppDatabase =
-        Room
+    ): AppDatabase {
+        val migrations =
+            arrayOf(
+                MIGRATION_1_2,
+                MIGRATION_2_3,
+                MIGRATION_3_4,
+                MIGRATION_4_5,
+                MIGRATION_5_6,
+                MIGRATION_6_7,
+                MIGRATION_7_8,
+                MIGRATION_8_9,
+                MIGRATION_9_10,
+            )
+        return Room
             .databaseBuilder(context, AppDatabase::class.java, "waddle.db")
-            .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
+            .addMigrations(*migrations)
             .build()
+    }
 
     @Provides
     fun provideAccountDao(database: AppDatabase): AccountDao = database.accountDao()
@@ -211,6 +224,55 @@ object AppModule {
                     )
                     """.trimIndent(),
                 )
+            }
+        }
+
+    private val MIGRATION_4_5 =
+        object : Migration(4, 5) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE messages ADD COLUMN hats TEXT")
+                db.execSQL("ALTER TABLE dm_messages ADD COLUMN hats TEXT")
+            }
+        }
+
+    private val MIGRATION_5_6 =
+        object : Migration(5, 6) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE messages ADD COLUMN threadId TEXT")
+                db.execSQL("ALTER TABLE messages ADD COLUMN parentThreadId TEXT")
+                db.execSQL("ALTER TABLE messages ADD COLUMN forumTopicTitle TEXT")
+                db.execSQL("ALTER TABLE messages ADD COLUMN forumReplyThreadId TEXT")
+                db.execSQL("ALTER TABLE dm_messages ADD COLUMN threadId TEXT")
+                db.execSQL("ALTER TABLE dm_messages ADD COLUMN parentThreadId TEXT")
+            }
+        }
+
+    private val MIGRATION_6_7 =
+        object : Migration(6, 7) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE channels ADD COLUMN channelType TEXT NOT NULL DEFAULT 'text'")
+            }
+        }
+
+    private val MIGRATION_7_8 =
+        object : Migration(7, 8) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE messages ADD COLUMN originStanzaId TEXT")
+            }
+        }
+
+    private val MIGRATION_8_9 =
+        object : Migration(8, 9) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE dm_messages ADD COLUMN replyToMessageId TEXT")
+            }
+        }
+
+    private val MIGRATION_9_10 =
+        object : Migration(9, 10) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE dm_messages ADD COLUMN originStanzaId TEXT")
+                db.execSQL("CREATE INDEX IF NOT EXISTS index_dm_messages_originStanzaId ON dm_messages(originStanzaId)")
             }
         }
 

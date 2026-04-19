@@ -18,7 +18,7 @@ import androidx.room.RoomDatabase
         PendingOutboundMessageEntity::class,
         LinkPreviewEntity::class,
     ],
-    version = 4,
+    version = 10,
     exportSchema = true,
 )
 abstract class AppDatabase : RoomDatabase() {

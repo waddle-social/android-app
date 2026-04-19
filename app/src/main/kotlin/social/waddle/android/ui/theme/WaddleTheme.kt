@@ -1,37 +1,38 @@
 package social.waddle.android.ui.theme
 
-import android.os.Build
 import androidx.compose.material3.ColorScheme
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
-import androidx.compose.material3.dynamicDarkColorScheme
-import androidx.compose.material3.dynamicLightColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalContext
+
+// Teal accents — design palette "Waddle teal".
+private val AccentDark = Color(0xFF00C4AB)
+private val AccentLight = Color(0xFF00A890)
 
 private val LightColors: ColorScheme =
     lightColorScheme(
-        primary = Color(0xFF611F69),
+        primary = AccentLight,
         onPrimary = Color.White,
-        primaryContainer = Color(0xFFF3E9F4),
-        onPrimaryContainer = Color(0xFF2C0C30),
-        secondary = Color(0xFF1264A3),
+        primaryContainer = Color(0xFFCFF0E9),
+        onPrimaryContainer = Color(0xFF003A33),
+        secondary = Color(0xFF4A5568),
         onSecondary = Color.White,
-        tertiary = Color(0xFFE01E5A),
+        tertiary = AccentLight,
         onTertiary = Color.White,
         background = Color(0xFFFFFFFF),
-        onBackground = Color(0xFF1D1C1D),
+        onBackground = Color(0xFF14161C),
         surface = Color(0xFFFFFFFF),
-        onSurface = Color(0xFF1D1C1D),
-        surfaceVariant = Color(0xFFF4EDE4),
-        onSurfaceVariant = Color(0xFF616061),
-        outline = Color(0xFFDDDDDD),
-        outlineVariant = Color(0xFFEAEAEA),
-        error = Color(0xFFE01E5A),
+        onSurface = Color(0xFF14161C),
+        surfaceVariant = Color(0xFFF5F6F8),
+        onSurfaceVariant = Color(0xFF6A6F7C),
+        outline = Color(0xFFE2E4E9),
+        outlineVariant = Color(0xFFEEF0F3),
+        error = Color(0xFFEF4444),
         onError = Color.White,
         errorContainer = Color(0xFFFCE4EC),
         onErrorContainer = Color(0xFF5C0F2A),
@@ -39,24 +40,24 @@ private val LightColors: ColorScheme =
 
 private val DarkColors: ColorScheme =
     darkColorScheme(
-        primary = Color(0xFFE7B1EF),
-        onPrimary = Color(0xFF2C0C30),
-        primaryContainer = Color(0xFF4A154B),
-        onPrimaryContainer = Color(0xFFF3E9F4),
-        secondary = Color(0xFF36C5F0),
-        onSecondary = Color(0xFF001D2F),
-        tertiary = Color(0xFFFF8EB0),
-        onTertiary = Color(0xFF5C0F2A),
-        background = Color(0xFF1A1D21),
-        onBackground = Color(0xFFE8E8E8),
-        surface = Color(0xFF222529),
-        onSurface = Color(0xFFE8E8E8),
-        surfaceVariant = Color(0xFF2C2F33),
-        onSurfaceVariant = Color(0xFFABABAD),
-        outline = Color(0xFF3A3D41),
-        outlineVariant = Color(0xFF2C2F33),
-        error = Color(0xFFFF8EB0),
-        onError = Color(0xFF5C0F2A),
+        primary = AccentDark,
+        onPrimary = Color(0xFF00241F),
+        primaryContainer = Color(0xFF00443B),
+        onPrimaryContainer = Color(0xFFB8F3E7),
+        secondary = Color(0xFFB0B4BF),
+        onSecondary = Color(0xFF14161C),
+        tertiary = AccentDark,
+        onTertiary = Color(0xFF00241F),
+        background = Color(0xFF0F1115),
+        onBackground = Color(0xFFE6E8ED),
+        surface = Color(0xFF0F1115),
+        onSurface = Color(0xFFE6E8ED),
+        surfaceVariant = Color(0xFF181B21),
+        onSurfaceVariant = Color(0xFF8A8F9C),
+        outline = Color(0xFF262A33),
+        outlineVariant = Color(0xFF1F2229),
+        error = Color(0xFFEF4444),
+        onError = Color.White,
         errorContainer = Color(0xFF5C0F2A),
         onErrorContainer = Color(0xFFFCE4EC),
     )
@@ -75,38 +76,47 @@ data class WaddleColors(
     val composerSurface: Color,
     val composerOutline: Color,
     val divider: Color,
+    val accentSoft: Color,
+    val unreadBadge: Color,
+    val fgMute: Color,
 )
 
 private val LightExtended: WaddleColors =
     WaddleColors(
-        sidebar = Color(0xFF3F0E40),
-        sidebarSurface = Color(0xFF350D36),
-        sidebarContent = Color(0xFFFFFFFF),
-        sidebarMuted = Color(0xFFBCABBC),
-        sidebarSelected = Color(0xFF1164A3),
-        sidebarSelectedContent = Color(0xFFFFFFFF),
-        mention = Color(0xFFFDE9C8),
-        onMention = Color(0xFF1D1C1D),
-        presenceOnline = Color(0xFF2BAC76),
-        composerSurface = Color(0xFFFFFFFF),
-        composerOutline = Color(0xFFBDBDBD),
-        divider = Color(0xFFEAEAEA),
+        sidebar = Color(0xFFFFFFFF),
+        sidebarSurface = Color(0xFFF5F6F8),
+        sidebarContent = Color(0xFF14161C),
+        sidebarMuted = Color(0xFF6A6F7C),
+        sidebarSelected = Color(0x1A00A890),
+        sidebarSelectedContent = AccentLight,
+        mention = Color(0x1A00A890),
+        onMention = Color(0xFF14161C),
+        presenceOnline = Color(0xFF10B981),
+        composerSurface = Color(0xFFF5F6F8),
+        composerOutline = Color(0xFFE2E4E9),
+        divider = Color(0xFFEEF0F3),
+        accentSoft = Color(0x1A00A890),
+        unreadBadge = Color(0xFFEF4444),
+        fgMute = Color(0xFFA0A5B2),
     )
 
 private val DarkExtended: WaddleColors =
     WaddleColors(
-        sidebar = Color(0xFF19171D),
-        sidebarSurface = Color(0xFF121016),
-        sidebarContent = Color(0xFFE8E8E8),
-        sidebarMuted = Color(0xFF8E8B92),
-        sidebarSelected = Color(0xFF1164A3),
-        sidebarSelectedContent = Color(0xFFFFFFFF),
-        mention = Color(0xFF5C4A24),
-        onMention = Color(0xFFFDE9C8),
-        presenceOnline = Color(0xFF34B27D),
-        composerSurface = Color(0xFF222529),
-        composerOutline = Color(0xFF3A3D41),
-        divider = Color(0xFF2C2F33),
+        sidebar = Color(0xFF0F1115),
+        sidebarSurface = Color(0xFF181B21),
+        sidebarContent = Color(0xFFE6E8ED),
+        sidebarMuted = Color(0xFF8A8F9C),
+        sidebarSelected = Color(0x2400C4AB),
+        sidebarSelectedContent = AccentDark,
+        mention = Color(0x2400C4AB),
+        onMention = Color(0xFFE6E8ED),
+        presenceOnline = Color(0xFF10B981),
+        composerSurface = Color(0xFF181B21),
+        composerOutline = Color(0xFF262A33),
+        divider = Color(0xFF1F2229),
+        accentSoft = Color(0x2400C4AB),
+        unreadBadge = Color(0xFFEF4444),
+        fgMute = Color(0xFF52576A),
     )
 
 val LocalWaddleColors = staticCompositionLocalOf { LightExtended }
@@ -114,26 +124,11 @@ val LocalWaddleColors = staticCompositionLocalOf { LightExtended }
 @Composable
 fun WaddleTheme(
     darkTheme: Boolean = false,
-    useDynamicColor: Boolean = true,
     content: @Composable () -> Unit,
 ) {
-    val context = LocalContext.current
-    val scheme =
-        when {
-            useDynamicColor && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> {
-                if (darkTheme) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context)
-            }
-
-            darkTheme -> {
-                DarkColors
-            }
-
-            else -> {
-                LightColors
-            }
-        }
+    val scheme = if (darkTheme) DarkColors else LightColors
     val extended = if (darkTheme) DarkExtended else LightExtended
-    androidx.compose.runtime.CompositionLocalProvider(LocalWaddleColors provides extended) {
+    CompositionLocalProvider(LocalWaddleColors provides extended) {
         MaterialTheme(
             colorScheme = scheme,
             content = content,

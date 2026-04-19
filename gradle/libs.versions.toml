@@ -60,6 +60,7 @@ androidx-test-runner = { module = "androidx.test:runner", version = "1.7.0" }
 appauth = { module = "net.openid:appauth", version.ref = "appauth" }
 androidx-biometric = { module = "androidx.biometric:biometric", version.ref = "biometric" }
 coil-compose = { module = "io.coil-kt.coil3:coil-compose", version.ref = "coil" }
+coil-gif = { module = "io.coil-kt.coil3:coil-gif", version.ref = "coil" }
 coil-network-ktor3 = { module = "io.coil-kt.coil3:coil-network-ktor3", version.ref = "coil" }
 hilt-android = { module = "com.google.dagger:hilt-android", version.ref = "hilt" }
 hilt-compiler = { module = "com.google.dagger:hilt-compiler", version.ref = "hilt" }
