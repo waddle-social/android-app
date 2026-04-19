@@ -1,4 +1,5 @@
 import dev.detekt.gradle.Detekt
+import org.gradle.api.tasks.testing.Test
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 import java.time.Instant
 
@@ -190,6 +191,10 @@ configurations.configureEach {
     exclude(group = "xpp3", module = "xpp3_min")
 }
 
+configurations.matching { it.name.contains("UnitTest") }.configureEach {
+    exclude(group = "org.igniterealtime.smack", module = "smack-xmlparser-xpp3")
+}
+
 dependencies {
     implementation(platform(libs.androidx.compose.bom))
     androidTestImplementation(platform(libs.androidx.compose.bom))
@@ -243,7 +248,12 @@ dependencies {
     debugImplementation(libs.androidx.compose.ui.test.manifest)
 
     testImplementation(libs.junit)
+    testImplementation(libs.ktor.client.cio)
     testImplementation(libs.kotlinx.coroutines.test)
+    testImplementation(libs.robolectric)
+    testImplementation(libs.smack.xmlparser.stax)
+    testImplementation(libs.sqlite.jdbc)
+    testImplementation(libs.testcontainers)
     testImplementation(libs.turbine)
 
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)
@@ -251,4 +261,23 @@ dependencies {
     androidTestImplementation(libs.androidx.test.ext.junit)
     androidTestImplementation(libs.androidx.test.runner)
     androidTestImplementation(libs.junit)
+}
+
+afterEvaluate {
+    tasks.named<Test>("testDebugUnitTest") {
+        exclude("**/e2e/**")
+    }
+
+    tasks.register<Test>("waddleE2eTest") {
+        group = "verification"
+        description = "Run Android app e2e tests against ghcr.io/waddle-social/waddle:main."
+
+        val debugUnitTest = tasks.named<Test>("testDebugUnitTest").get()
+        testClassesDirs = debugUnitTest.testClassesDirs
+        classpath = debugUnitTest.classpath
+        shouldRunAfter(debugUnitTest)
+
+        include("**/e2e/**")
+        systemProperty("waddle.e2e", "true")
+    }
 }

@@ -23,7 +23,10 @@ lifecycle = "2.10.0"
 jsoup = "1.22.1"
 navigation3 = "1.1.0"
 room = "2.8.4"
+robolectric = "4.16.1"
 smack = "4.5.0-rc1"
+sqliteJdbc = "3.53.0.0"
+testcontainers = "2.0.4"
 turbine = "1.2.1"
 work = "2.11.2"
 hiltWork = "1.3.0"
@@ -51,6 +54,7 @@ androidx-navigation3-ui = { module = "androidx.navigation3:navigation3-ui", vers
 androidx-room-compiler = { module = "androidx.room:room-compiler", version.ref = "room" }
 androidx-room-ktx = { module = "androidx.room:room-ktx", version.ref = "room" }
 androidx-room-runtime = { module = "androidx.room:room-runtime", version.ref = "room" }
+robolectric = { module = "org.robolectric:robolectric", version.ref = "robolectric" }
 androidx-work-runtime = { module = "androidx.work:work-runtime-ktx", version.ref = "work" }
 androidx-hilt-work = { module = "androidx.hilt:hilt-work", version.ref = "hiltWork" }
 androidx-hilt-compiler = { module = "androidx.hilt:hilt-compiler", version.ref = "hiltWork" }
@@ -72,6 +76,7 @@ kotlinx-coroutines-android = { module = "org.jetbrains.kotlinx:kotlinx-coroutine
 kotlinx-coroutines-test = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-test", version.ref = "coroutines" }
 kotlinx-serialization-json = { module = "org.jetbrains.kotlinx:kotlinx-serialization-json", version.ref = "kotlinxSerializationJson" }
 ktor-client-android = { module = "io.ktor:ktor-client-android", version.ref = "ktor" }
+ktor-client-cio = { module = "io.ktor:ktor-client-cio", version.ref = "ktor" }
 ktor-client-content-negotiation = { module = "io.ktor:ktor-client-content-negotiation", version.ref = "ktor" }
 ktor-client-core = { module = "io.ktor:ktor-client-core", version.ref = "ktor" }
 ktor-client-logging = { module = "io.ktor:ktor-client-logging", version.ref = "ktor" }
@@ -82,6 +87,9 @@ smack-experimental = { module = "org.igniterealtime.smack:smack-experimental", v
 smack-im = { module = "org.igniterealtime.smack:smack-im", version.ref = "smack" }
 smack-tcp = { module = "org.igniterealtime.smack:smack-tcp", version.ref = "smack" }
 smack-websocket-okhttp = { module = "org.igniterealtime.smack:smack-websocket-okhttp", version.ref = "smack" }
+smack-xmlparser-stax = { module = "org.igniterealtime.smack:smack-xmlparser-stax", version.ref = "smack" }
+sqlite-jdbc = { module = "org.xerial:sqlite-jdbc", version.ref = "sqliteJdbc" }
+testcontainers = { module = "org.testcontainers:testcontainers", version.ref = "testcontainers" }
 turbine = { module = "app.cash.turbine:turbine", version.ref = "turbine" }
 
 [plugins]
