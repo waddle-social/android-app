@@ -20,10 +20,9 @@ import social.waddle.android.data.model.AuthSession
 import social.waddle.android.data.model.SessionResponse
 import social.waddle.android.data.model.StoredSession
 import social.waddle.android.data.model.WaddleEnvironment
-import social.waddle.android.data.network.WaddleApi
+import social.waddle.android.data.network.WaddleGateway
 import social.waddle.android.util.WaddleLog
 import social.waddle.android.xmpp.SessionProvider
-import social.waddle.android.xmpp.XmppClient
 import java.net.URI
 import java.time.Instant
 import javax.inject.Inject
@@ -39,8 +38,7 @@ class AuthRepository
         private val sessionStore: SecureSessionStore,
         private val accountDao: AccountDao,
         private val database: AppDatabase,
-        private val xmppClient: XmppClient,
-        private val api: WaddleApi,
+        private val waddle: WaddleGateway,
     ) : SessionProvider {
         override suspend fun currentSession(): StoredSession? = ensureFreshSession()
 
@@ -103,7 +101,7 @@ class AuthRepository
             val accessToken =
                 tokenResponse.accessToken
                     ?: error("Refresh-token response did not include access_token.")
-            val sessionResponse = api.fetchSession(current.environment, accessToken)
+            val sessionResponse = waddle.fetchSession(current.environment, accessToken)
             require(!sessionResponse.isExpired) { "Refreshed session is marked expired." }
             val updated =
                 current.copy(
@@ -171,7 +169,7 @@ class AuthRepository
                 runCatching { Instant.ofEpochMilli(millis).toString() }.getOrNull()
             }
 
-        suspend fun authProviders(environment: WaddleEnvironment): List<AuthProviderSummary> = api.authProviders(environment)
+        suspend fun authProviders(environment: WaddleEnvironment): List<AuthProviderSummary> = waddle.authProviders(environment)
 
         fun buildAuthorizationRequest(
             environment: WaddleEnvironment,
@@ -189,7 +187,7 @@ class AuthRepository
         ): AuthSession {
             val tokenResponse = performTokenRequest(response)
             val accessToken = tokenResponse.accessToken ?: error("Waddle OAuth token response did not include access_token.")
-            val sessionResponse = api.fetchSession(environment, accessToken)
+            val sessionResponse = waddle.fetchSession(environment, accessToken)
             require(!sessionResponse.isExpired) { "Waddle OAuth session is expired." }
 
             val stored =
@@ -214,7 +212,7 @@ class AuthRepository
 
         private suspend fun disconnectXmpp() {
             runCatching {
-                xmppClient.disconnect()
+                waddle.disconnect()
             }.onFailure { throwable ->
                 WaddleLog.error("XMPP disconnect failed during logout.", throwable)
             }

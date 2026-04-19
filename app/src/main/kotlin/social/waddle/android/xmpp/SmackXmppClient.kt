@@ -47,6 +47,7 @@ import org.jivesoftware.smack.packet.StandardExtensionElement
 import org.jivesoftware.smack.packet.Stanza
 import org.jivesoftware.smack.packet.StanzaBuilder
 import org.jivesoftware.smack.packet.XmlElement
+import org.jivesoftware.smack.parsing.StandardExtensionElementProvider
 import org.jivesoftware.smack.provider.ProviderManager
 import org.jivesoftware.smack.sm.StreamManagementModule
 import org.jivesoftware.smack.sm.StreamManagementModuleDescriptor
@@ -57,6 +58,7 @@ import org.jivesoftware.smack.websocket.XmppWebSocketTransportModuleDescriptor
 import org.jivesoftware.smack.websocket.okhttp.OkHttpWebSocketFactory
 import org.jivesoftware.smackx.carbons.CarbonManager
 import org.jivesoftware.smackx.carbons.packet.CarbonExtension
+import org.jivesoftware.smackx.commands.AdHocCommandManager
 import org.jivesoftware.smackx.disco.ServiceDiscoveryManager
 import org.jivesoftware.smackx.httpfileupload.HttpFileUploadManager
 import org.jivesoftware.smackx.mam.element.MamElements
@@ -170,6 +172,7 @@ class SmackXmppClient
                 AndroidSmackInitializer.initialize(context)
                 registerMamProviders()
                 registerCallProviders()
+                registerStandardExtensionProviders()
                 registerOAuthBearer()
                 val nextNickname = nicknameFor(session)
                 buildConnection(session, environment).also { next ->
@@ -300,6 +303,48 @@ class SmackXmppClient
                             channelType = channelType,
                         )
                     }
+            }
+
+        override suspend fun createChannel(
+            waddleId: String,
+            name: String,
+            description: String?,
+            channelType: String,
+            position: Int,
+        ): XmppChannelRef =
+            withConnection { activeConnection ->
+                val domain = accountBareJid?.substringAfter('@') ?: error("No authenticated account JID.")
+                val command =
+                    AdHocCommandManager
+                        .getInstance(activeConnection)
+                        .getRemoteCommand(JidCreate.domainBareFrom(domain), CREATE_CHANNEL_COMMAND)
+                val form = command.execute().asExecutingOrThrow().fillableForm
+                form.setAnswer("waddle_id", waddleId)
+                form.setAnswer("name", name)
+                form.setAnswer("description", description.orEmpty())
+                form.setAnswer("channel_type", channelType)
+                form.setAnswer("position", position)
+                val resultForm =
+                    command
+                        .complete(form.submitForm)
+                        .asCompletedOrThrow()
+                        .response.form
+                val channelId =
+                    resultForm
+                        ?.getField("channel_id")
+                        ?.firstValue
+                        ?: error("Create-channel command completed without channel_id.")
+                val channelJid =
+                    resultForm
+                        .getField("channel_jid")
+                        ?.firstValue
+                        ?: error("Create-channel command completed without channel_jid.")
+                XmppChannelRef(
+                    id = channelId,
+                    name = name,
+                    roomJid = channelJid,
+                    channelType = channelType,
+                )
             }
 
         override suspend fun sendGroupMessage(draft: ChatMessageDraft): String =
@@ -1787,6 +1832,16 @@ class SmackXmppClient
             )
         }
 
+        private fun registerStandardExtensionProviders() {
+            STANDARD_EXTENSION_PROVIDERS.forEach { (element, namespace) ->
+                ProviderManager.addExtensionProvider(
+                    element,
+                    namespace,
+                    StandardExtensionElementProvider.INSTANCE,
+                )
+            }
+        }
+
         private fun ChatFileAttachment.toFileSharingExtension(): org.jivesoftware.smack.packet.XmlElement =
             XmppExtensions.fileSharing(
                 url = url,
@@ -1903,6 +1958,7 @@ class SmackXmppClient
             const val CHAT_MARKERS_NAMESPACE = "urn:xmpp:chat-markers:0"
             const val CHAT_STATES_NAMESPACE = "http://jabber.org/protocol/chatstates"
             const val CORRECTION_NAMESPACE = "urn:xmpp:message-correct:0"
+            const val CREATE_CHANNEL_COMMAND = "waddle:create-channel"
             const val EXPLICIT_MENTIONS_NAMESPACE = "urn:xmpp:emn:0"
             const val FALLBACK_NAMESPACE = "urn:xmpp:fallback:0"
             const val FILE_SHARING_NAMESPACE = "urn:xmpp:sfs:0"
@@ -1954,6 +2010,29 @@ class SmackXmppClient
                     RETRACTION_NAMESPACE,
                     STICKERS_NAMESPACE,
                     URL_DATA_NAMESPACE,
+                )
+            val STANDARD_EXTENSION_PROVIDERS =
+                listOf(
+                    "displayed" to CHAT_MARKERS_NAMESPACE,
+                    "fallback" to FALLBACK_NAMESPACE,
+                    "file" to FILE_METADATA_NAMESPACE,
+                    "file-sharing" to FILE_SHARING_NAMESPACE,
+                    "invite" to CALL_INVITES_NAMESPACE,
+                    "markable" to CHAT_MARKERS_NAMESPACE,
+                    "meeting" to social.waddle.android.xmpp.call.CallNamespaces.MEETING,
+                    "mentions" to EXPLICIT_MENTIONS_NAMESPACE,
+                    "origin-id" to ORIGIN_ID_NAMESPACE,
+                    "reaction" to REACTIONS_NAMESPACE,
+                    "reactions" to REACTIONS_NAMESPACE,
+                    "reference" to REFERENCE_NAMESPACE,
+                    "replace" to CORRECTION_NAMESPACE,
+                    "reply" to REPLY_NAMESPACE,
+                    "retract" to RETRACTION_NAMESPACE,
+                    "sources" to FILE_SHARING_NAMESPACE,
+                    "sticker" to STICKERS_NAMESPACE,
+                    "thread-create" to FORUMS_FEATURE,
+                    "thread-reply" to FORUMS_FEATURE,
+                    "url-data" to URL_DATA_NAMESPACE,
                 )
         }
     }

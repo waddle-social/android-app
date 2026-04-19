@@ -193,6 +193,14 @@ interface XmppClient {
         waddleId: String,
     ): List<XmppChannelRef>
 
+    suspend fun createChannel(
+        waddleId: String,
+        name: String,
+        description: String? = null,
+        channelType: String = "text",
+        position: Int = 0,
+    ): XmppChannelRef
+
     suspend fun sendGroupMessage(draft: ChatMessageDraft): String
 
     suspend fun loadMessageHistory(

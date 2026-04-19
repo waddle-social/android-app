@@ -40,6 +40,8 @@ import social.waddle.android.data.db.OccupantDao
 import social.waddle.android.data.db.PendingOutboundDao
 import social.waddle.android.data.db.ReactionDao
 import social.waddle.android.data.db.WaddleDao
+import social.waddle.android.data.network.RealWaddleGateway
+import social.waddle.android.data.network.WaddleGateway
 import social.waddle.android.xmpp.SessionProvider
 import social.waddle.android.xmpp.SmackXmppClient
 import social.waddle.android.xmpp.XmppClient
@@ -302,6 +304,10 @@ abstract class XmppModule {
     @Binds
     @Singleton
     abstract fun bindXmppClient(client: SmackXmppClient): XmppClient
+
+    @Binds
+    @Singleton
+    abstract fun bindWaddleGateway(gateway: RealWaddleGateway): WaddleGateway
 
     @Binds
     @Singleton

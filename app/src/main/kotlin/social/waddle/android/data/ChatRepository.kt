@@ -43,12 +43,11 @@ import social.waddle.android.data.model.UpdateChannelRequest
 import social.waddle.android.data.model.UpdateWaddleRequest
 import social.waddle.android.data.model.UserSearchResult
 import social.waddle.android.data.model.WaddleSummary
-import social.waddle.android.data.network.WaddleApi
+import social.waddle.android.data.network.WaddleGateway
 import social.waddle.android.util.WaddleLog
 import social.waddle.android.xmpp.ChatState
 import social.waddle.android.xmpp.SessionProvider
 import social.waddle.android.xmpp.WaddleHat
-import social.waddle.android.xmpp.XmppClient
 import social.waddle.android.xmpp.XmppConnectionState
 import social.waddle.android.xmpp.XmppDirectMessage
 import social.waddle.android.xmpp.XmppHistoryMessage
@@ -71,8 +70,7 @@ class ChatRepository
         private val dmReactionDao: DmReactionDao,
         private val deliveryStateDao: DeliveryStateDao,
         private val pendingOutboundDao: PendingOutboundDao,
-        private val xmppClient: XmppClient,
-        private val api: WaddleApi,
+        private val waddle: WaddleGateway,
         private val sessionProvider: SessionProvider,
     ) {
         private val repositoryScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -100,14 +98,14 @@ class ChatRepository
 
         fun observeDirectTyping(): StateFlow<Map<String, Boolean>> = mutableDirectTyping.asStateFlow()
 
-        fun observePresences(): StateFlow<Map<String, Boolean>> = xmppClient.presences
+        fun observePresences(): StateFlow<Map<String, Boolean>> = waddle.presences
 
         /** XEP-0502 Activity Indicator: set of room JIDs the server has marked as recently active. */
-        fun observeActiveRoomJids(): StateFlow<Set<String>> = xmppClient.activeRoomJids
+        fun observeActiveRoomJids(): StateFlow<Set<String>> = waddle.activeRoomJids
 
         /** Clear the given room from the activity set after the user visits it (client-side only). */
         fun clearRoomActivity(roomJid: String) {
-            xmppClient.clearRoomActivity(roomJid)
+            waddle.clearRoomActivity(roomJid)
         }
 
         suspend fun channelByIdSnapshot(channelId: String): ChannelEntity? =
@@ -123,7 +121,7 @@ class ChatRepository
             startIncomingMessageCollection()
             startIncomingDirectMessageCollection()
             startConnectionStateWatch()
-            xmppClient.connect(session, session.environment)
+            waddle.connect(session, session.environment)
             // replayPending is also triggered by the connection-state watch on every
             // successful (re)connect, so we don't need to call it here.
             warmDmArchive(session)
@@ -131,7 +129,7 @@ class ChatRepository
 
         private suspend fun warmDmArchive(session: StoredSession) {
             runCatching {
-                val page = xmppClient.loadAllDirectMessageHistory(ownBareJid = session.jid)
+                val page = waddle.loadAllDirectMessageHistory(ownBareJid = session.jid)
                 if (page.messages.isEmpty()) {
                     return@runCatching
                 }
@@ -149,7 +147,7 @@ class ChatRepository
             connectionStateJob =
                 repositoryScope.launch {
                     var wasConnected = false
-                    xmppClient.connectionState.collect { state ->
+                    waddle.connectionState.collect { state ->
                         val nowConnected = state is XmppConnectionState.Connected
                         if (nowConnected && !wasConnected) {
                             runCatching { replayPending() }
@@ -165,7 +163,7 @@ class ChatRepository
         suspend fun refreshWaddles(session: StoredSession) =
             withContext(Dispatchers.IO) {
                 val waddles =
-                    xmppClient.discoverWaddles(session).map { ref ->
+                    waddle.discoverWaddles(session).map { ref ->
                         WaddleEntity(
                             id = ref.id,
                             name = ref.name,
@@ -186,7 +184,7 @@ class ChatRepository
             // room's disco#info features (XEP-0508 `urn:xmpp:forums:0`). No
             // REST fallback; per CLAUDE.md we're XMPP-native.
             val channels =
-                xmppClient.discoverChannels(session, waddleId).map { ref ->
+                waddle.discoverChannels(session, waddleId).map { ref ->
                     ChannelEntity(
                         id = ref.id,
                         waddleId = waddleId,
@@ -207,7 +205,7 @@ class ChatRepository
                 var loadedPages = 0
                 var hasMore = true
                 while (hasMore) {
-                    val page = xmppClient.loadMessageHistory(channel.roomJid, afterId = afterId)
+                    val page = waddle.loadMessageHistory(channel.roomJid, afterId = afterId)
                     cacheMessageHistoryPage(channel, page.messages)
                     afterId = page.lastId
                     loadedPages += 1
@@ -226,7 +224,7 @@ class ChatRepository
                 val channel = channelDao.getChannel(channelId) ?: return@withContext
                 val oldest = messageDao.oldestMessage(channelId) ?: return@withContext
                 val beforeId = oldest.serverId ?: oldest.id
-                val page = xmppClient.loadMessageHistory(channel.roomJid, beforeId = beforeId)
+                val page = waddle.loadMessageHistory(channel.roomJid, beforeId = beforeId)
                 cacheMessageHistoryPage(channel, page.messages)
             }
 
@@ -235,14 +233,14 @@ class ChatRepository
             query: String,
         ): List<WaddleSummary> =
             withContext(Dispatchers.IO) {
-                api.publicWaddles(session.environment, session.sessionId, query)
+                waddle.publicWaddles(session.environment, session.sessionId, query)
             }
 
         suspend fun joinWaddle(
             session: StoredSession,
             waddleId: String,
         ) = withContext(Dispatchers.IO) {
-            api.joinWaddle(session.environment, session.sessionId, waddleId)
+            waddle.joinWaddle(session.environment, session.sessionId, waddleId)
             refreshWaddles(session)
         }
 
@@ -252,7 +250,7 @@ class ChatRepository
             description: String?,
             isPublic: Boolean,
         ) = withContext(Dispatchers.IO) {
-            api.createWaddle(
+            waddle.createWaddle(
                 environment = session.environment,
                 sessionId = session.sessionId,
                 input =
@@ -272,7 +270,7 @@ class ChatRepository
             description: String?,
             isPublic: Boolean?,
         ) = withContext(Dispatchers.IO) {
-            api.updateWaddle(
+            waddle.updateWaddle(
                 environment = session.environment,
                 sessionId = session.sessionId,
                 waddleId = waddleId,
@@ -290,7 +288,7 @@ class ChatRepository
             session: StoredSession,
             waddleId: String,
         ) = withContext(Dispatchers.IO) {
-            api.deleteWaddle(session.environment, session.sessionId, waddleId)
+            waddle.deleteWaddle(session.environment, session.sessionId, waddleId)
             refreshWaddles(session)
         }
 
@@ -300,7 +298,7 @@ class ChatRepository
             name: String,
             description: String?,
         ) = withContext(Dispatchers.IO) {
-            api.createChannel(
+            waddle.createChannel(
                 environment = session.environment,
                 sessionId = session.sessionId,
                 waddleId = waddleId,
@@ -318,7 +316,7 @@ class ChatRepository
             waddleId: String,
             channelId: String,
         ) = withContext(Dispatchers.IO) {
-            api.deleteChannel(session.environment, session.sessionId, waddleId, channelId)
+            waddle.deleteChannel(session.environment, session.sessionId, waddleId, channelId)
             channelDao.delete(channelId)
         }
 
@@ -330,7 +328,7 @@ class ChatRepository
             description: String?,
             position: Int?,
         ) = withContext(Dispatchers.IO) {
-            api.updateChannel(
+            waddle.updateChannel(
                 environment = session.environment,
                 sessionId = session.sessionId,
                 waddleId = waddleId,
@@ -350,7 +348,7 @@ class ChatRepository
             waddleId: String,
         ): List<MemberSummary> =
             withContext(Dispatchers.IO) {
-                api.listMembers(session.environment, session.sessionId, waddleId)
+                waddle.listMembers(session.environment, session.sessionId, waddleId)
             }
 
         suspend fun searchUsers(
@@ -361,7 +359,7 @@ class ChatRepository
                 if (query.isBlank()) {
                     emptyList()
                 } else {
-                    api.searchUsers(session.environment, session.sessionId, query.trim())
+                    waddle.searchUsers(session.environment, session.sessionId, query.trim())
                 }
             }
 
@@ -373,7 +371,7 @@ class ChatRepository
                 return@withContext
             }
             val channel = channelDao.getChannel(channelId) ?: return@withContext
-            val results = xmppClient.searchMessageHistory(channel.roomJid, query)
+            val results = waddle.searchMessageHistory(channel.roomJid, query)
             cacheMessageHistoryPage(channel, results)
         }
 
@@ -385,7 +383,7 @@ class ChatRepository
             if (query.isBlank()) {
                 return@withContext
             }
-            val results = xmppClient.searchDirectMessageHistory(session.jid, peerJid, query)
+            val results = waddle.searchDirectMessageHistory(session.jid, peerJid, query)
             cacheDirectMessageHistoryPage(results)
         }
 
@@ -396,8 +394,8 @@ class ChatRepository
             role: String,
         ): List<MemberSummary> =
             withContext(Dispatchers.IO) {
-                api.addMember(session.environment, session.sessionId, waddleId, userId, role)
-                api.listMembers(session.environment, session.sessionId, waddleId)
+                waddle.addMember(session.environment, session.sessionId, waddleId, userId, role)
+                waddle.listMembers(session.environment, session.sessionId, waddleId)
             }
 
         suspend fun updateMemberRole(
@@ -407,8 +405,8 @@ class ChatRepository
             role: String,
         ): List<MemberSummary> =
             withContext(Dispatchers.IO) {
-                api.updateMemberRole(session.environment, session.sessionId, waddleId, userId, role)
-                api.listMembers(session.environment, session.sessionId, waddleId)
+                waddle.updateMemberRole(session.environment, session.sessionId, waddleId, userId, role)
+                waddle.listMembers(session.environment, session.sessionId, waddleId)
             }
 
         suspend fun removeMember(
@@ -417,8 +415,8 @@ class ChatRepository
             userId: String,
         ): List<MemberSummary> =
             withContext(Dispatchers.IO) {
-                api.removeMember(session.environment, session.sessionId, waddleId, userId)
-                api.listMembers(session.environment, session.sessionId, waddleId)
+                waddle.removeMember(session.environment, session.sessionId, waddleId, userId)
+                waddle.listMembers(session.environment, session.sessionId, waddleId)
             }
 
         suspend fun refreshDirectMessages(
@@ -429,7 +427,7 @@ class ChatRepository
             var loadedPages = 0
             var hasMore = true
             while (hasMore) {
-                val page = xmppClient.loadDirectMessageHistory(session.jid, peerJid, afterId = afterId)
+                val page = waddle.loadDirectMessageHistory(session.jid, peerJid, afterId = afterId)
                 cacheDirectMessageHistoryPage(page.messages)
                 afterId = page.lastId
                 loadedPages += 1
@@ -449,7 +447,7 @@ class ChatRepository
         ) = withContext(Dispatchers.IO) {
             val oldest = dmMessageDao.oldestMessage(peerJid) ?: return@withContext
             val beforeId = oldest.serverId ?: oldest.id
-            val page = xmppClient.loadDirectMessageHistory(session.jid, peerJid, beforeId = beforeId)
+            val page = waddle.loadDirectMessageHistory(session.jid, peerJid, beforeId = beforeId)
             cacheDirectMessageHistoryPage(page.messages)
         }
 
@@ -496,7 +494,7 @@ class ChatRepository
                 )
             dmMessageDao.upsert(message)
             upsertConversation(message)
-            xmppClient.sendDirectMessage(
+            waddle.sendDirectMessage(
                 peerJid = peerJid,
                 body = body,
                 stanzaId = localId,
@@ -549,7 +547,7 @@ class ChatRepository
                 )
             dmMessageDao.upsert(message)
             upsertConversation(message)
-            xmppClient.sendDirectMessage(peerJid, body, localId, sharedFile)
+            waddle.sendDirectMessage(peerJid, body, localId, sharedFile)
             dmMessageDao.clearPending(localId)
         }
 
@@ -557,14 +555,14 @@ class ChatRepository
             peerJid: String,
             messageId: String,
         ) = withContext(Dispatchers.IO) {
-            xmppClient.markDirectDisplayed(peerJid, messageId)
+            waddle.markDirectDisplayed(peerJid, messageId)
         }
 
         suspend fun setDirectComposing(
             peerJid: String,
             composing: Boolean,
         ) = withContext(Dispatchers.IO) {
-            xmppClient.setDirectChatState(peerJid, if (composing) ChatState.Composing else ChatState.Active)
+            waddle.setDirectChatState(peerJid, if (composing) ChatState.Composing else ChatState.Active)
         }
 
         suspend fun editDirect(
@@ -572,7 +570,7 @@ class ChatRepository
             messageId: String,
             body: String,
         ) = withContext(Dispatchers.IO) {
-            xmppClient.correctDirectMessage(peerJid, messageId, body)
+            waddle.correctDirectMessage(peerJid, messageId, body)
             dmMessageDao.markEdited(messageId, body, Instant.now().toString())
         }
 
@@ -580,7 +578,7 @@ class ChatRepository
             peerJid: String,
             messageId: String,
         ) = withContext(Dispatchers.IO) {
-            xmppClient.retractDirectMessage(peerJid, messageId)
+            waddle.retractDirectMessage(peerJid, messageId)
             dmMessageDao.markRetracted(messageId)
         }
 
@@ -592,7 +590,7 @@ class ChatRepository
         ) = withContext(Dispatchers.IO) {
             val hasReaction = dmReactionDao.hasReaction(messageId, senderId, emoji)
             val nextEmojis = if (hasReaction) emptyList() else listOf(emoji)
-            xmppClient.reactDirect(peerJid, messageId, nextEmojis)
+            waddle.reactDirect(peerJid, messageId, nextEmojis)
             dmReactionDao.deleteForSender(messageId, senderId)
             nextEmojis.forEach { nextEmoji ->
                 dmReactionDao.upsert(
@@ -679,7 +677,7 @@ class ChatRepository
                     retryCount = 0,
                 ),
             )
-            xmppClient.sendGroupMessage(draft)
+            waddle.sendGroupMessage(draft)
             messageDao.clearPending(localId)
             pendingOutboundDao.delete(localId)
         }
@@ -739,7 +737,7 @@ class ChatRepository
                     originStanzaId = localId,
                 ),
             )
-            xmppClient.sendGroupMessage(draft)
+            waddle.sendGroupMessage(draft)
             messageDao.clearPending(localId)
         }
 
@@ -748,7 +746,7 @@ class ChatRepository
             messageId: String,
         ) = withContext(Dispatchers.IO) {
             channelDao.getChannel(channelId)?.let { channel ->
-                xmppClient.markDisplayed(channel.roomJid, messageId)
+                waddle.markDisplayed(channel.roomJid, messageId)
             }
         }
 
@@ -757,7 +755,7 @@ class ChatRepository
             composing: Boolean,
         ) = withContext(Dispatchers.IO) {
             channelDao.getChannel(channelId)?.let { channel ->
-                xmppClient.setChatState(channel.roomJid, if (composing) ChatState.Composing else ChatState.Active)
+                waddle.setChatState(channel.roomJid, if (composing) ChatState.Composing else ChatState.Active)
             }
         }
 
@@ -766,7 +764,7 @@ class ChatRepository
             messageId: String,
         ) = withContext(Dispatchers.IO) {
             channelDao.getChannel(channelId)?.let { channel ->
-                xmppClient.retractMessage(channel.roomJid, messageId)
+                waddle.retractMessage(channel.roomJid, messageId)
                 messageDao.markRetracted(messageId)
             }
         }
@@ -777,7 +775,7 @@ class ChatRepository
             body: String,
         ) = withContext(Dispatchers.IO) {
             channelDao.getChannel(channelId)?.let { channel ->
-                xmppClient.correctMessage(channel.roomJid, messageId, body)
+                waddle.correctMessage(channel.roomJid, messageId, body)
                 messageDao.markEdited(messageId, body, Instant.now().toString())
             }
         }
@@ -791,7 +789,7 @@ class ChatRepository
             channelDao.getChannel(channelId)?.let { channel ->
                 val hasReaction = reactionDao.hasReaction(messageId, senderId, emoji)
                 val nextEmojis = if (hasReaction) emptyList() else listOf(emoji)
-                xmppClient.react(channel.roomJid, messageId, nextEmojis)
+                waddle.react(channel.roomJid, messageId, nextEmojis)
                 reactionDao.deleteForSender(messageId, senderId)
                 nextEmojis.forEach { nextEmoji ->
                     reactionDao.upsert(
@@ -808,7 +806,7 @@ class ChatRepository
 
         private suspend fun replayPending() {
             pendingOutboundDao.pending().forEach { pending ->
-                xmppClient.sendGroupMessage(
+                waddle.sendGroupMessage(
                     ChatMessageDraft(
                         channelId = pending.channelId,
                         roomJid = pending.roomJid,
@@ -827,7 +825,7 @@ class ChatRepository
             }
             incomingMessagesJob =
                 repositoryScope.launch {
-                    xmppClient.incomingMessages.collect { message ->
+                    waddle.incomingMessages.collect { message ->
                         runCatching {
                             cacheIncomingMessage(message)
                         }.onFailure { throwable ->
@@ -843,7 +841,7 @@ class ChatRepository
             }
             incomingDirectMessagesJob =
                 repositoryScope.launch {
-                    xmppClient.incomingDirectMessages.collect { message ->
+                    waddle.incomingDirectMessages.collect { message ->
                         runCatching {
                             cacheIncomingDirectMessage(message)
                         }.onFailure { throwable ->
@@ -1257,13 +1255,13 @@ class ChatRepository
             require(attachment.bytes.isNotEmpty()) { "Cannot upload an empty file." }
             val slot =
                 requireNotNull(
-                    xmppClient.uploadSlot(
+                    waddle.uploadSlot(
                         filename = attachment.name,
                         contentType = attachment.mediaType,
                         sizeBytes = attachment.bytes.size.toLong(),
                     ),
                 ) { "XEP-0363 upload is not available for this account." }
-            api.uploadToSlot(
+            waddle.uploadToSlot(
                 putUrl = slot.putUrl,
                 bytes = attachment.bytes,
                 contentType = attachment.mediaType,
